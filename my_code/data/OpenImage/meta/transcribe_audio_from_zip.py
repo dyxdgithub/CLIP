@@ -1,9 +1,11 @@
-"""Transcribe CSV-referenced audio files already extracted to an audio folder."""
+"""Extract CSV-referenced audio from a ZIP and transcribe it with Whisper."""
 
 import argparse
 import csv
 import os
+import shutil
 import sys
+import zipfile
 from collections import OrderedDict
 from pathlib import Path
 
@@ -11,18 +13,10 @@ from tqdm import tqdm
 
 
 META_DIR = Path(__file__).resolve().parent
-DEFAULT_CSV = (
-    META_DIR
-    / "Hierarchy"
-    / "n2"
-    / "audio_image"
-    / "images"
-    / "image_download_manifest_with_audio_info.csv"
-)
+DEFAULT_CSV = META_DIR / "Hierarchy" / "n2" / "audio_image" / "images" / "image_download_manifest_with_audio_info.csv"
+DEFAULT_ZIP = Path(r"E:\数据集\Open Image\train\open_images_train_audio.zip")
 DEFAULT_AUDIO_DIR = META_DIR / "Hierarchy" / "n2" / "audio_image" / "audio"
-DEFAULT_OUTPUT = (
-    META_DIR / "Hierarchy" / "n2" / "audio_image" / "audio_transcriptions.csv"
-)
+DEFAULT_OUTPUT = META_DIR / "Hierarchy" / "n2" / "audio_image" / "audio_transcriptions.csv"
 OUTPUT_FIELDS = ["ClassName", "Human_LabelName", "ImageID", "Caption"]
 PROGRESS_FIELDS = ["FileName", "ImageID", "Status", "Caption", "Error"]
 
@@ -77,16 +71,43 @@ def read_audio_rows(csv_path):
                 continue
             row = dict(row)
             row["FileName"] = filename
-            key = (
-                filename,
-                image_id,
-                row.get("ClassName", ""),
-                row.get("Human_LabelName", ""),
-            )
+            key = (filename, image_id, row.get("Human_LabelName", ""), row.get("Human_DisplayName", ""))
             if key not in seen:
                 rows.append(row)
                 seen.add(key)
     return rows
+
+
+def index_zip_audio(zip_path):
+    members = OrderedDict()
+    with zipfile.ZipFile(zip_path) as archive:
+        for info in archive.infolist():
+            if not info.is_dir():
+                members.setdefault(Path(info.filename).name, info.filename)
+    return members
+
+
+def extract_audio_files(rows, zip_path, audio_dir):
+    audio_dir = Path(audio_dir)
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    members = index_zip_audio(zip_path)
+    extracted = {}
+    missing = set()
+    with zipfile.ZipFile(zip_path) as archive:
+        for row in tqdm(rows, desc="Extracting audio", unit="row"):
+            filename = row["FileName"]
+            if filename in extracted:
+                continue
+            archive_name = members.get(filename)
+            if not archive_name:
+                missing.add(filename)
+                continue
+            destination = audio_dir / filename
+            if not destination.exists():
+                with archive.open(archive_name) as source, destination.open("wb") as target:
+                    shutil.copyfileobj(source, target)
+            extracted[filename] = str(destination.resolve())
+    return extracted, missing
 
 
 def group_rows_by_filename(rows):
@@ -171,21 +192,9 @@ def write_completed_output(rows, completed, output_path):
     return len(written)
 
 
-def find_audio_paths(rows, audio_dir):
-    audio_dir = Path(audio_dir)
-    audio_paths = {}
-    missing = set()
-    for filename in group_rows_by_filename(rows):
-        audio_path = audio_dir / filename
-        if audio_path.is_file():
-            audio_paths[filename] = str(audio_path.resolve())
-        else:
-            missing.add(filename)
-    return audio_paths, missing
-
-
 def transcribe(
     rows,
+    zip_path,
     audio_dir,
     output_path,
     progress_path,
@@ -196,6 +205,11 @@ def transcribe(
     resume,
     completed,
 ):
+    import torch
+    import whisper
+
+    if device.startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError("CUDA is unavailable. Use --device cpu or fix the GPU environment.")
     rows_by_filename = group_rows_by_filename(rows)
     if resume:
         existing_captions = load_existing_captions(output_path)
@@ -221,16 +235,20 @@ def transcribe(
     if not pending_rows:
         return completed, 0, 0
 
-    audio_paths, missing = find_audio_paths(pending_rows, audio_dir)
+    audio_paths, missing = extract_audio_files(pending_rows, zip_path, audio_dir)
     ready_rows = [row for row in pending_rows if row["FileName"] in audio_paths]
+    for row in pending_rows:
+        if row["FileName"] not in audio_paths:
+            append_progress(
+                progress_path,
+                row["FileName"],
+                row.get("ImageID", ""),
+                "error",
+                error="audio not found in ZIP",
+            )
     if not ready_rows:
         return completed, 0, len(missing)
 
-    import torch
-    import whisper
-
-    if device.startswith("cuda") and not torch.cuda.is_available():
-        raise RuntimeError("CUDA is unavailable. Use --device cpu or fix the GPU environment.")
     model = whisper.load_model(model_size, device=device)
     use_fp16 = device.startswith("cuda")
     print("Using GPU: {}".format(use_fp16))
@@ -271,85 +289,50 @@ def whisper_result(model, audio_path, language, beam_size, fp16):
     if language:
         options["language"] = language
     result = model.transcribe(audio_path, **options)
-    return {"Text": result.get("text", "").strip()}
+    return {"Text": result.get("text", "").strip(), "Status": "ok", "Error": ""}
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description=__doc__,
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    parser.add_argument(
-        "--csv",
-        type=Path,
-        default=DEFAULT_CSV,
-        help="Metadata CSV containing FileName or AudioFileName and ImageID.",
-    )
-    parser.add_argument(
-        "--audio-dir",
-        type=Path,
-        default=DEFAULT_AUDIO_DIR,
-        help="Directory containing audio files extracted by extract_audio_from_zip.py.",
-    )
-    parser.add_argument(
-        "--output",
-        type=Path,
-        default=DEFAULT_OUTPUT,
-        help="Four-column caption CSV written from completed transcriptions.",
-    )
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--csv", type=Path, default=DEFAULT_CSV)
+    parser.add_argument("--zip", type=Path, default=DEFAULT_ZIP)
+    parser.add_argument("--audio-dir", type=Path, default=DEFAULT_AUDIO_DIR)
+    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument(
         "--progress",
         type=Path,
         default=None,
-        help="Audio-level checkpoint CSV; defaults beside --output.",
+        help="Audio-level checkpoint CSV. Defaults beside --output.",
     )
     parser.add_argument(
         "--no-resume",
         action="store_false",
         dest="resume",
-        help="Ignore successful checkpoint entries and transcribe every available audio file.",
+        help="Ignore the checkpoint and re-transcribe every audio file.",
     )
     parser.set_defaults(resume=True)
-    parser.add_argument(
-        "--model-size",
-        default="small",
-        help="Whisper model identifier, such as tiny, base, small, medium, large-v3, or turbo.",
-    )
-    parser.add_argument(
-        "--device",
-        default="cuda",
-        help="Torch device, for example cuda, cuda:0, or cpu.",
-    )
-    parser.add_argument(
-        "--language",
-        default=None,
-        help="Optional spoken-language code, for example en; omit to auto-detect.",
-    )
-    parser.add_argument(
-        "--beam-size",
-        type=int,
-        default=5,
-        help="Positive Whisper beam-search width.",
-    )
+    parser.add_argument("--model-size", default="small")
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--language", default=None)
+    parser.add_argument("--beam-size", type=int, default=5)
     parser.add_argument(
         "--ffmpeg-path",
         default=None,
-        help="Path to ffmpeg.exe or its containing directory; omit to auto-detect.",
+        help="Path to ffmpeg.exe or the directory containing it.",
     )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    if args.beam_size <= 0:
-        raise ValueError("--beam-size must be positive")
-    print("Using ffmpeg: {}".format(configure_ffmpeg(args.ffmpeg_path)))
+    # print("Using ffmpeg: {}".format(configure_ffmpeg(args.ffmpeg_path)))
     rows = read_audio_rows(args.csv)
     progress_path = args.progress or args.output.with_suffix(".progress.csv")
     completed = load_completed_progress(progress_path) if args.resume else {}
     try:
         completed, transcribed, missing_count = transcribe(
             rows,
+            args.zip,
             args.audio_dir,
             args.output,
             progress_path,
