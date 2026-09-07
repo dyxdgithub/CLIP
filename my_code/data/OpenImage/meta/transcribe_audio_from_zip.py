@@ -196,11 +196,6 @@ def transcribe(
     resume,
     completed,
 ):
-    import torch
-    import whisper
-
-    if device.startswith("cuda") and not torch.cuda.is_available():
-        raise RuntimeError("CUDA is unavailable. Use --device cpu or fix the GPU environment.")
     rows_by_filename = group_rows_by_filename(rows)
     if resume:
         existing_captions = load_existing_captions(output_path)
@@ -231,6 +226,11 @@ def transcribe(
     if not ready_rows:
         return completed, 0, len(missing)
 
+    import torch
+    import whisper
+
+    if device.startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError("CUDA is unavailable. Use --device cpu or fix the GPU environment.")
     model = whisper.load_model(model_size, device=device)
     use_fp16 = device.startswith("cuda")
     print("Using GPU: {}".format(use_fp16))
