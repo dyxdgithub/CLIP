@@ -1,0 +1,105 @@
+{
+  "version": "2.0",
+  "project": {
+    "name": "TinyCLIP",
+    "type": "library",
+    "language": "python",
+    "description": "PyTorch implementation of TinyCLIP: CLIP distillation via affinity mimicking and weight inheritance."
+  },
+  "runtime": {
+    "language": "python",
+    "version": "3.10",
+    "package_manager": "pip",
+    "build_command": "python -m compileall -q src my_code inference.py measure_throughput.py",
+    "test_command": "python -m pytest -x -s -v tests",
+    "lint_command": "make lint-arch",
+    "dev_command": "python -m training.main_for_test --help"
+  },
+  "startup": {
+    "command": "python -c \"exec(open('src/open_clip/version.py').read()); print('TinyCLIP', __version__, 'ready for library use')\"",
+    "args": [],
+    "working_dir": ".",
+    "env": {
+      "PYTHONPATH": "src"
+    },
+    "readiness": {
+      "type": "none"
+    }
+  },
+  "services": [],
+  "env_vars": {
+    "required": {},
+    "optional": {
+      "PYTHONPATH": {
+        "purpose": "Makes src/training and src/open_clip importable during training/evaluation.",
+        "default": "src",
+        "sensitive": false
+      },
+      "HF_TOKEN": {
+        "purpose": "Hugging Face token used only by my_code/test/dataset.py for gated datasets.",
+        "default": null,
+        "sensitive": true
+      },
+      "EVAL_FREQ": {
+        "purpose": "Training evaluation frequency in steps.",
+        "default": "1000",
+        "sensitive": false
+      },
+      "SAVE_FREQ": {
+        "purpose": "Training checkpoint frequency in steps.",
+        "default": "1000",
+        "sensitive": false
+      },
+      "EVAL_EMB": {
+        "purpose": "Optional cached zero-shot classifier path.",
+        "default": null,
+        "sensitive": false
+      }
+    }
+  },
+  "endpoints": {},
+  "scripts": {
+    "setup": "harness/scripts/setup-env.sh",
+    "start": "harness/scripts/start-server.sh",
+    "teardown": "harness/scripts/teardown-env.sh"
+  },
+  "functional_scenarios": [
+    {
+      "name": "library_smoke_check",
+      "description": "Verify the version module is readable and the harness environment is consistent.",
+      "prerequisites": [],
+      "steps": [
+        "Run harness/scripts/start-server.sh",
+        "Confirm it prints the TinyCLIP version and exits zero"
+      ],
+      "expected_outcome": "Version is printed without importing PyTorch."
+    },
+    {
+      "name": "architecture_boundary_check",
+      "description": "Verify package imports respect the open_clip/training/my_code layer boundaries.",
+      "prerequisites": [],
+      "steps": [
+        "Run python scripts/lint_deps.py",
+        "Run python scripts/lint_quality.py"
+      ],
+      "expected_outcome": "Dependency linter passes and quality linter reports only known warnings."
+    }
+  ],
+  "_meta": {
+    "generated_by": "harness-creator",
+    "generated_at": "2026-08-25T00:00:00Z",
+    "schema_version": "2.0",
+    "requires_user_input": [
+      "HF_TOKEN"
+    ],
+    "assumptions": [
+      "Project is a Python library with training/evaluation CLI entry points.",
+      "No external services are required for core model operations.",
+      "Training and evaluation require NVIDIA GPUs and dataset paths supplied by the user."
+    ],
+    "todos": [
+      "Set HF_TOKEN only when using my_code/test/dataset.py with gated datasets.",
+      "Add tests under tests/ before enabling make test in CI."
+    ]
+  }
+}
