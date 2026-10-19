@@ -6,8 +6,14 @@
 启动时会检查每个 ImageID 是否至少有一个对应图片；可用 `--skip-file-check` 跳过预检。
 启动器默认设置 `ALLOW_TRUNCATED_IMAGES=1`：严格解码失败且 Pillow 明确报告图片截断时，
 会重试读取并在终端警告中显示文件路径；这类图片的缺失像素可能影响数据质量。
-需要严格拒绝截断图片时，设 `ALLOW_TRUNCATED_IMAGES=0`。无法恢复的图片仍会带路径报错，
-应据此重新下载或修复源文件。该策略记录在运行的 `config.json` 中。
+需要严格拒绝截断图片时，设 `ALLOW_TRUNCATED_IMAGES=0`。该策略记录在运行的
+`config.json` 中。
+检索启动器默认设置 `SKIP_BAD_IMAGES=1`：无法解码的图片会被跳过，路径和错误
+写入输出目录的 `bad_images.jsonl`，训练与验证指标会记录可用图像数和跳过数。
+验证检索只使用成功读取的图像及其 caption。若某训练批次不足两张可用图像，
+该批次不更新参数，并记录丢弃的单张图像数。设置 `SKIP_BAD_IMAGES=0` 可在坏图处报错。
+正式比较模型时，应修复坏图或注明实际参与训练、验证和测试的样本数。
+多标签分类启动器仍会在无法解码图片时报错并显示路径。
 这份 8:1:1 划分来自原始 Open Images train 子集，报告结果时应称为自定义划分，
 不要称为官方测试集。
 
@@ -59,18 +65,19 @@ bash my_code/train/run_finetune_clip_multilabel.sh
 预训练 CLIP state dict。
 
 ```bash
-IMAGE_ROOT=/path/to/images_all \
+OUTPUT_PATH=/path/to/existing/run \
   bash my_code/train/run_finetune_clip_retrieval.sh \
-  --resume my_code/train/output/clip_retrieval_ViT-B-32/last.pt \
-  --epochs 10
+  --resume /path/to/existing/run/last.pt
 ```
 
 训练记录写入输出目录中的 `config.json`、`metrics.jsonl`、`tensorboard/`、
 `last.pt` 和 `best.pt`。TensorBoard 保存 step 损失与学习率、epoch 损失、
 验证损失和任务指标；执行测试时也保存测试指标。脚本按 epoch 保存断点；
 从 `last.pt` 恢复时从下一轮继续，并在 TensorBoard 中延续全局 step。
-若在首个 epoch 完成前失败，尚无 checkpoint；重新运行时应设置新的 `OUTPUT_PATH`，
-保留旧目录中的诊断日志。
+检索启动器默认按时间和进程号为每次运行生成独立输出目录。若在首个 epoch
+完成前失败，尚无 checkpoint；直接重跑会创建新目录。手动指定 `OUTPUT_PATH`
+时，请为新运行指定新目录，保留旧目录中的诊断日志。恢复已有 checkpoint 时，
+将 `OUTPUT_PATH` 指向该 checkpoint 所在目录。
 `--eval-only` 的结果写入单独的 `tensorboard_eval/`，不会覆盖已有训练曲线。
 在仓库根目录查看所有训练曲线：
 

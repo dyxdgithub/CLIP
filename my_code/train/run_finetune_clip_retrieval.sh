@@ -18,6 +18,14 @@ elif [[ "$ALLOW_TRUNCATED_IMAGES" != "0" ]]; then
   echo "ALLOW_TRUNCATED_IMAGES must be 0 or 1" >&2
   exit 2
 fi
+SKIP_BAD_IMAGES="${SKIP_BAD_IMAGES:-1}"
+BAD_IMAGE_ARGS=()
+if [[ "$SKIP_BAD_IMAGES" == "1" ]]; then
+  BAD_IMAGE_ARGS+=(--skip-bad-images)
+elif [[ "$SKIP_BAD_IMAGES" != "0" ]]; then
+  echo "SKIP_BAD_IMAGES must be 0 or 1" >&2
+  exit 2
+fi
 OUTPUT_PATH="${OUTPUT_PATH:-$SCRIPT_DIR/output/clip_retrieval_$MODEL_SLUG}"
 DEVICE="${DEVICE:-cuda:3}"
 PRECISION="${PRECISION:-auto}"
@@ -28,6 +36,10 @@ SCORE_BATCH_SIZE="${SCORE_BATCH_SIZE:-128}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 LEARNING_RATE="${LEARNING_RATE:-1e-5}"
 SEED="${SEED:-42}"
+OUTPUT_PATH="${OUTPUT_PATH:-$SCRIPT_DIR/output/clip_retrieval_${MODEL_SLUG}_bs${BATCH_SIZE}_$(date +%Y%m%d_%H%M%S)_$$}"
+
+printf 'Training configuration: device=%s batch_size=%s eval_batch_size=%s output=%s\n' \
+  "$DEVICE" "$BATCH_SIZE" "$EVAL_BATCH_SIZE" "$OUTPUT_PATH"
 
 "$PYTHON_BIN" my_code/train/finetune_clip_retrieval.py \
   --split-csv my_code/data/Image_IDs_n2_all_downloaded_split_8_1_1.csv \
@@ -35,6 +47,7 @@ SEED="${SEED:-42}"
   --image-root "$IMAGE_ROOT" \
   --image-layout "$IMAGE_LAYOUT" \
   "${TRUNCATED_IMAGE_ARGS[@]}" \
+  "${BAD_IMAGE_ARGS[@]}" \
   --output-dir "$OUTPUT_PATH" \
   --model "$MODEL_NAME" \
   --device "$DEVICE" \

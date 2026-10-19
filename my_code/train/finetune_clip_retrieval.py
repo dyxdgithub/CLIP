@@ -32,7 +32,7 @@ import torch
 import torch.nn.functional as F
 from clip.model import build_model
 from PIL import Image, ImageFile
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, default_collate
 from torchvision import transforms
 from tqdm import tqdm
 
@@ -65,9 +65,11 @@ def parse_args(argv=None):
     parser.add_argument("--image-layout", choices=("relative", "flat"), default="relative",
                         help="How to find images below --image-root. Default: %(default)s.")
     parser.add_argument("--skip-file-check", action="store_true",
-                        help="Skip startup existence checks; missing files will fail during loading.")
+                        help="Skip startup existence checks; missing files fail during loading unless --skip-bad-images is set.")
     parser.add_argument("--allow-truncated-images", action="store_true",
                         help="Retry images rejected as truncated with Pillow's partial-image decoder; recovered paths are warned.")
+    parser.add_argument("--skip-bad-images", action="store_true",
+                        help="Skip images that cannot be decoded; record their paths in bad_images.jsonl and report counts.")
     parser.add_argument("--model", default="ViT-B/32",
                         help="Name from clip.available_models() or a pretrained CLIP state-dict path. Default: %(default)s.")
     parser.add_argument("--download-root", type=Path,
@@ -231,12 +233,13 @@ def load_rgb_image(path, allow_truncated=False):
 
 
 class ImageTextDataset(Dataset):
-    def __init__(self, samples, caption_tokens, transform, seed, allow_truncated=False):
+    def __init__(self, samples, caption_tokens, transform, seed, allow_truncated=False, skip_bad_images=False):
         self.samples = samples
         self.caption_tokens = caption_tokens
         self.transform = transform
         self.seed = seed
         self.allow_truncated = allow_truncated
+        self.skip_bad_images = skip_bad_images
         self.epoch = 0
 
     def __len__(self):
@@ -246,8 +249,22 @@ class ImageTextDataset(Dataset):
         sample = self.samples[index]
         caption_indices = sample.caption_indices
         caption_index = caption_indices[(self.seed + self.epoch + index) % len(caption_indices)]
-        pixels = self.transform(load_rgb_image(sample.image_path, self.allow_truncated))
-        return pixels, self.caption_tokens[caption_index], caption_index
+        try:
+            pixels = self.transform(load_rgb_image(sample.image_path, self.allow_truncated))
+        except (OSError, ValueError, Image.DecompressionBombError) as exc:
+            if not self.skip_bad_images:
+                raise
+            return None, {
+                "index": index, "image_id": sample.image_id,
+                "path": str(sample.image_path), "reason": str(exc),
+            }
+        return pixels, self.caption_tokens[caption_index], caption_index, index
+
+
+def collate_image_text_batch(items):
+    valid = [item for item in items if item[0] is not None]
+    errors = [item[1] for item in items if item[0] is None]
+    return (default_collate(valid) if valid else None), errors
 
 
 def train_transform(size):
@@ -281,10 +298,11 @@ def load_pretrained(name, device, download_root):
     return model.to(device), preprocess
 
 
-def make_loader(dataset, batch_size, workers, shuffle, seed, drop_last=False):
+def make_loader(dataset, batch_size, workers, shuffle, seed, drop_last=False, collate_fn=None):
     generator = torch.Generator().manual_seed(seed)
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=workers,
-                      pin_memory=torch.cuda.is_available(), generator=generator, drop_last=drop_last)
+                      pin_memory=torch.cuda.is_available(), generator=generator, drop_last=drop_last,
+                      collate_fn=collate_fn)
 
 
 def choose_device(name):
@@ -382,6 +400,19 @@ def append_log(path, data, writer=None):
         writer.flush()
 
 
+def record_bad_images(path, errors, split, epoch, seen):
+    new_errors = [error for error in errors if error["image_id"] not in seen]
+    if not new_errors:
+        return
+    with path.open("a", encoding="utf-8") as handle:
+        for error in new_errors:
+            seen.add(error["image_id"])
+            record = {"split": split, "epoch": epoch, **error}
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            print("Skipping unreadable image {}: {}".format(error["path"], error["reason"]),
+                  file=sys.stderr, flush=True)
+
+
 def save_checkpoint(path, model, optimizer, scaler, epoch, global_step, best_score, identity):
     payload = {
         "model": model.state_dict(),
@@ -407,16 +438,27 @@ def load_checkpoint(path, model, optimizer, scaler, identity):
     return payload
 
 
-def train_epoch(model, dataset, args, device, precision, optimizer, scaler, epoch, global_step, total_steps, log_path, writer):
+def train_epoch(model, dataset, args, device, precision, optimizer, scaler, epoch, global_step, total_steps,
+                log_path, writer, bad_image_path, seen_bad_images):
     model.train()
     dataset.epoch = epoch
     drop_singleton = len(dataset) % args.batch_size == 1
     loader = make_loader(dataset, args.batch_size, args.num_workers, True, args.seed + epoch,
-                         drop_last=drop_singleton)
+                         drop_last=drop_singleton, collate_fn=collate_image_text_batch)
     totals = torch.zeros(3, dtype=torch.float64)
     count = 0
+    skipped_bad = 0
+    dropped_singleton = int(drop_singleton)
     with tqdm(loader, desc="Train epoch {}/{}".format(epoch + 1, args.epochs), unit="batch") as progress:
-        for images, tokens, caption_indices in progress:
+        for batch, errors in progress:
+            skipped_bad += len(errors)
+            record_bad_images(bad_image_path, errors, "train", epoch + 1, seen_bad_images)
+            if batch is None:
+                continue
+            images, tokens, caption_indices, _ = batch
+            if images.shape[0] < 2:
+                dropped_singleton += images.shape[0]
+                continue
             images = images.to(device, non_blocking=True)
             tokens = tokens.to(device, non_blocking=True)
             caption_indices = caption_indices.to(device, non_blocking=True)
@@ -450,10 +492,15 @@ def train_epoch(model, dataset, args, device, precision, optimizer, scaler, epoc
                     "train_step/loss_i2t": image_loss.item(), "train_step/loss_t2i": text_loss.item(),
                     "train_step/lr": lr,
                 }, writer)
+    if not count:
+        raise RuntimeError("No training batches contain at least two readable images")
     return global_step, {
         "train_epoch/loss_total": (totals[0] / count).item(),
         "train_epoch/loss_i2t": (totals[1] / count).item(),
         "train_epoch/loss_t2i": (totals[2] / count).item(),
+        "train_epoch/usable_images": count,
+        "train_epoch/skipped_bad_images": skipped_bad,
+        "train_epoch/dropped_singleton_images": dropped_singleton,
     }
 
 
@@ -473,15 +520,26 @@ def recall_at_k(query_features, candidate_features, positives, device, block_siz
 
 
 @torch.no_grad()
-def evaluate(model, samples, caption_tokens, preprocess, args, device, precision, split):
+def evaluate(model, samples, caption_tokens, preprocess, args, device, precision, split,
+             bad_image_path, seen_bad_images):
     model.eval()
-    dataset = ImageTextDataset(samples, caption_tokens, preprocess, args.seed, args.allow_truncated_images)
-    loader = make_loader(dataset, args.eval_batch_size, args.num_workers, False, args.seed)
+    dataset = ImageTextDataset(samples, caption_tokens, preprocess, args.seed,
+                               args.allow_truncated_images, args.skip_bad_images)
+    loader = make_loader(dataset, args.eval_batch_size, args.num_workers, False, args.seed,
+                         collate_fn=collate_image_text_batch)
     image_features = []
+    valid_samples = []
     loss_total = 0.0
     image_count = 0
+    skipped_bad = 0
     with tqdm(loader, desc="Encode {} images".format(split), unit="batch") as progress:
-        for images, tokens, caption_indices in progress:
+        for batch, errors in progress:
+            skipped_bad += len(errors)
+            record_bad_images(bad_image_path, errors, split, "eval", seen_bad_images)
+            if batch is None:
+                continue
+            images, tokens, caption_indices, sample_indices = batch
+            valid_samples.extend(samples[index] for index in sample_indices.tolist())
             images = images.to(device, non_blocking=True)
             tokens = tokens.to(device, non_blocking=True)
             caption_indices = caption_indices.to(device, non_blocking=True)
@@ -493,9 +551,11 @@ def evaluate(model, samples, caption_tokens, preprocess, args, device, precision
             image_features.append(image_embedding.cpu())
             loss_total += loss.item() * images.shape[0]
             image_count += images.shape[0]
+    if not image_count:
+        raise RuntimeError("No readable images in {} split".format(split))
     image_features = torch.cat(image_features, dim=0)
 
-    text_indices = sorted({index for sample in samples for index in sample.caption_indices})
+    text_indices = sorted({index for sample in valid_samples for index in sample.caption_indices})
     text_position = {index: position for position, index in enumerate(text_indices)}
     text_features = []
     for start in tqdm(range(0, len(text_indices), args.eval_batch_size),
@@ -506,14 +566,18 @@ def evaluate(model, samples, caption_tokens, preprocess, args, device, precision
             text_features.append(F.normalize(model.encode_text(tokens).float(), dim=-1).cpu())
     text_features = torch.cat(text_features, dim=0)
 
-    image_positives = [set(text_position[index] for index in sample.caption_indices) for sample in samples]
+    image_positives = [set(text_position[index] for index in sample.caption_indices) for sample in valid_samples]
     text_positives = [set() for _ in text_indices]
     for image_position, indices in enumerate(image_positives):
         for text_position_index in indices:
             text_positives[text_position_index].add(image_position)
     i2t = recall_at_k(image_features, text_features, image_positives, device, args.score_batch_size)
     t2i = recall_at_k(text_features, image_features, text_positives, device, args.score_batch_size)
-    metrics = {split + "/loss_total": loss_total / image_count}
+    metrics = {
+        split + "/loss_total": loss_total / image_count,
+        split + "/usable_images": image_count,
+        split + "/skipped_bad_images": skipped_bad,
+    }
     metrics.update({split + "/i2t_" + key: value for key, value in i2t.items()})
     metrics.update({split + "/t2i_" + key: value for key, value in t2i.items()})
     metrics[split + "/mean_recall"] = sum(i2t.values()) / 6 + sum(t2i.values()) / 6
@@ -557,7 +621,7 @@ def main(argv=None):
     }
     train_dataset = ImageTextDataset(by_split["train"], caption_tokens,
                                      train_transform(model.visual.input_resolution), args.seed,
-                                     args.allow_truncated_images)
+                                     args.allow_truncated_images, args.skip_bad_images)
     if len(train_dataset) < 2:
         raise ValueError("Contrastive training needs at least two training images")
     optimizer = make_optimizer(model, args.lr, args.weight_decay)
@@ -577,6 +641,11 @@ def main(argv=None):
         config["caption_sampling"] = "one per ImageID per epoch"
         config_path.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
     log_path = args.output_dir / "metrics.jsonl"
+    bad_image_path = args.output_dir / "bad_images.jsonl"
+    seen_bad_images = set()
+    if bad_image_path.is_file():
+        with bad_image_path.open("r", encoding="utf-8") as handle:
+            seen_bad_images = {json.loads(line)["image_id"] for line in handle if line.strip()}
     start_epoch, global_step, best_score = 0, 0, -math.inf
     if args.resume:
         payload = load_checkpoint(args.resume, model, optimizer, scaler, identity)
@@ -589,7 +658,8 @@ def main(argv=None):
                        purge_step=global_step + 1 if args.resume and not args.eval_only else None) as writer:
         if args.eval_only:
             for split in ("validation", "test"):
-                metrics = evaluate(model, by_split[split], caption_tokens, preprocess, args, device, precision, split)
+                metrics = evaluate(model, by_split[split], caption_tokens, preprocess, args, device, precision,
+                                   split, bad_image_path, seen_bad_images)
                 append_log(log_path, {"epoch": "eval_only", "step": global_step, **metrics}, writer)
                 print(json.dumps(metrics, indent=2), flush=True)
             return
@@ -600,9 +670,9 @@ def main(argv=None):
         for epoch in range(start_epoch, args.epochs):
             global_step, train_metrics = train_epoch(
                 model, train_dataset, args, device, precision, optimizer, scaler,
-                epoch, global_step, total_steps, log_path, writer)
+                epoch, global_step, total_steps, log_path, writer, bad_image_path, seen_bad_images)
             val_metrics = evaluate(model, by_split["validation"], caption_tokens, preprocess,
-                                   args, device, precision, "validation")
+                                   args, device, precision, "validation", bad_image_path, seen_bad_images)
             metrics = {"epoch": epoch + 1, "step": global_step, **train_metrics, **val_metrics}
             append_log(log_path, metrics, writer)
             print(json.dumps(metrics, indent=2), flush=True)
@@ -619,7 +689,7 @@ def main(argv=None):
         if args.test_after_train:
             load_checkpoint(best_path, model, optimizer, scaler, identity)
             test_metrics = evaluate(model, by_split["test"], caption_tokens, preprocess,
-                                    args, device, precision, "test")
+                                    args, device, precision, "test", bad_image_path, seen_bad_images)
             append_log(log_path, {"epoch": "best", "step": global_step, **test_metrics}, writer)
             print(json.dumps(test_metrics, indent=2), flush=True)
     print("Outputs: {}".format(args.output_dir), flush=True)
