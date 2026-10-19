@@ -26,7 +26,6 @@ elif [[ "$SKIP_BAD_IMAGES" != "0" ]]; then
   echo "SKIP_BAD_IMAGES must be 0 or 1" >&2
   exit 2
 fi
-OUTPUT_PATH="${OUTPUT_PATH:-$SCRIPT_DIR/output/clip_retrieval_$MODEL_SLUG}"
 DEVICE="${DEVICE:-cuda:3}"
 PRECISION="${PRECISION:-auto}"
 EPOCHS="${EPOCHS:-50}"
