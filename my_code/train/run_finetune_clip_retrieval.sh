@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
 
-IMAGE_ROOT="${IMAGE_ROOT:-$REPO_ROOT/my_code/data/images_all}"
+IMAGE_ROOT="${IMAGE_ROOT:-/media/xyycyc/Elements/dyx/TinyCLIP/my_code/data/OpenImage/meta/Hierarchy/n2/images_all}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 MODEL_NAME="${MODEL_NAME:-ViT-B/32}"
 MODEL_SLUG="${MODEL_NAME//\//-}"

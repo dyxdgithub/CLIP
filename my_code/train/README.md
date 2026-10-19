@@ -13,7 +13,7 @@
 bash my_code/train/run_finetune_clip_retrieval.sh
 ```
 
-检索启动器默认从当前仓库的 `my_code/data/images_all` 读取图片；若服务器上的图片另存于其他位置，可在命令前设置 `IMAGE_ROOT=/path/to/images_all`。
+两个启动器默认从 `/media/xyycyc/Elements/dyx/TinyCLIP/my_code/data/OpenImage/meta/Hierarchy/n2/images_all` 读取图片；若图片另存于其他位置，可在命令前设置 `IMAGE_ROOT=/path/to/images_all`。
 
 使用 `Image_IDs_n2_all_downloaded_split_8_1_1.csv` 的划分和
 `Image IDs_with_last_two_layers_multi_members_n2_one_label_per_parent.csv` 的 caption。
@@ -26,7 +26,7 @@ Recall@1/5/10。验证选最佳 checkpoint，训练默认不评估测试集；
 ## 多标签分类
 
 ```bash
-IMAGE_ROOT=/path/to/images_all bash my_code/train/run_finetune_clip_multilabel.sh
+bash my_code/train/run_finetune_clip_multilabel.sh
 ```
 
 按 ImageID 汇总叶类别，计算图像与每个类别 prompt 的相似度，并对已知正负类别
