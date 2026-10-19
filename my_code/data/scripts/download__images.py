@@ -11,6 +11,7 @@ import argparse
 import csv
 import hashlib
 import json
+import os
 import re
 import shutil
 import sqlite3
@@ -53,7 +54,7 @@ def parse_args(argv=None):
     parser.add_argument("--fiftyone-dataset-name", default="tinyclip_n2_fallback", help="Prefix for per-batch FiftyOne dataset names. Default: %(default)s")
     parser.add_argument("--dataset-dir", type=Path, help="FiftyOne cache directory. Default: FiftyOne's configured directory.")
     parser.add_argument("--fiftyone-batch-size", type=int, default=500, help="Unique IDs requested per FiftyOne call. Default: %(default)s")
-    parser.add_argument("--workers", type=int, default=16, help="FiftyOne and URL download workers. Default: %(default)s")
+    parser.add_argument("--workers", type=int, default=16, help="Existing-image checks, FiftyOne, and URL download workers. Default: %(default)s")
     parser.add_argument("--tfds-name", default="open_images_v4/200k", help="TFDS builder/configuration. Default: %(default)s")
     parser.add_argument("--tfds-data-dir", type=Path, help="TFDS prepared-data directory. Default: OpenImages/tfds_open_images_v4.")
     parser.add_argument("--download-tfds-data", action="store_true", help="Allow TFDS to prepare/download missing data; this may require substantial disk space. Default: false.")
@@ -185,22 +186,14 @@ class DownloadStore:
                     if tuple(saved) != current:
                         raise ValueError("Checkpoint does not match the input manifest; use a different --checkpoint-db/--status-output")
                     progress.update(1)
-        with tqdm(total=len(manifest_rows), desc="Seeding checkpoint", unit="row", mininterval=refresh_seconds) as progress:
-            for offset in range(0, len(manifest_rows), 5000):
-                batch = manifest_rows[offset:offset + 5000]
-                self.db.executemany("INSERT OR IGNORE INTO rows VALUES (?, ?, ?, ?, 'pending', '', '', '')", batch)
-                progress.update(len(batch))
-        with tqdm(total=len(manifest_rows), desc="Checking checkpoint", unit="row", mininterval=refresh_seconds) as progress:
-            for number, _, _, _ in manifest_rows:
-                status, path = self.db.execute("SELECT status, path FROM rows WHERE number = ?", (number,)).fetchone()
-                if status in DONE:
-                    try:
-                        image_suffix(Path(path))
-                    except (OSError, ValueError):
-                        self.db.execute("UPDATE rows SET status = 'pending', source = '', path = '', error = '' WHERE number = ?", (number,))
-                elif status == "failed":
-                    self.db.execute("UPDATE rows SET status = 'pending', error = '' WHERE number = ?", (number,))
-                progress.update(1)
+        if not prior_count:
+            with tqdm(total=len(manifest_rows), desc="Seeding checkpoint", unit="row", mininterval=refresh_seconds) as progress:
+                for offset in range(0, len(manifest_rows), 5000):
+                    batch = manifest_rows[offset:offset + 5000]
+                    self.db.executemany("INSERT INTO rows VALUES (?, ?, ?, ?, 'pending', '', '', '')", batch)
+                    progress.update(len(batch))
+        # Failed rows are retried; check_existing_images validates completed paths once.
+        self.db.execute("UPDATE rows SET status = 'pending', source = '', path = '', error = '' WHERE status = 'failed'")
         self.db.commit()
 
     def pending_rows(self, image_id):
@@ -281,6 +274,94 @@ def write_status(input_path, output_path, fields, store, refresh_seconds):
 
 def destination_folder(paths, output_dir, parent, leaf):
     return output_dir if paths is None else output_dir.joinpath(*paths[(parent, leaf)])
+
+
+def check_existing_images(store, manifest_rows, paths, output_dir, workers, refresh_seconds):
+    """Check checkpoint paths and indexed output folders with bounded image decoders."""
+    suffixes = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
+    folder_names = {}
+    updates = []
+
+    def names_in(folder):
+        if folder not in folder_names:
+            try:
+                with os.scandir(folder) as entries:
+                    folder_names[folder] = {
+                        entry.name.lower() for entry in entries
+                        if entry.name.lower().endswith(suffixes)
+                    }
+            except (FileNotFoundError, NotADirectoryError):
+                folder_names[folder] = set()
+        return folder_names[folder]
+
+    def flush_updates():
+        if updates:
+            store.db.executemany(
+                "UPDATE rows SET status = ?, source = ?, path = ?, error = ? WHERE number = ?",
+                updates,
+            )
+            store.db.commit()
+            updates.clear()
+
+    def check_paths(candidates):
+        for candidate in candidates:
+            try:
+                image_suffix(candidate)
+                return candidate
+            except (OSError, ValueError):
+                pass
+        return None
+
+    with tqdm(total=len(manifest_rows), desc="Checking existing images", unit="row", mininterval=refresh_seconds) as progress:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {}
+            cursor = store.db.execute("SELECT number, image_id, parent, leaf, status, path FROM rows ORDER BY number")
+
+            def finish_one():
+                finished, _ = wait(futures, return_when=FIRST_COMPLETED)
+                for future in finished:
+                    number, status, saved_path = futures.pop(future)
+                    found = future.result()
+                    if found is None:
+                        if status in DONE:
+                            updates.append(("pending", "", "", "", number))
+                    elif status not in DONE or str(found) != saved_path:
+                        updates.append(("existing", str(found), str(found), "", number))
+                    progress.update(1)
+                if len(updates) >= 5000:
+                    flush_updates()
+
+            while True:
+                batch = cursor.fetchmany(5000)
+                if not batch:
+                    break
+                for number, image_id, parent, leaf, status, saved_path in batch:
+                    if paths is not None and (parent, leaf) not in paths:
+                        updates.append(("failed", "", "", "Parent/leaf label pair absent from class tree", number))
+                        progress.update(1)
+                        continue
+                    folder = destination_folder(paths, output_dir, parent, leaf)
+                    candidates = []
+                    if status in DONE and saved_path and Path(saved_path).parent == folder:
+                        candidates.append(Path(saved_path))
+                    names = names_in(folder)
+                    for suffix in suffixes:
+                        candidate = folder / (image_id + suffix)
+                        if candidate.name.lower() in names and candidate not in candidates:
+                            candidates.append(candidate)
+                    if candidates:
+                        futures[pool.submit(check_paths, candidates)] = (number, status, saved_path)
+                        if len(futures) >= workers * 4:
+                            finish_one()
+                    else:
+                        if status in DONE:
+                            updates.append(("pending", "", "", "", number))
+                        progress.update(1)
+                if len(updates) >= 5000:
+                    flush_updates()
+            while futures:
+                finish_one()
+            flush_updates()
 
 
 def apply_source(image_id, source_path, source_kind, source_label, store, paths, output_dir):
@@ -482,24 +563,12 @@ def process_manifest(args, expected_split=None):
     store = DownloadStore(checkpoint)
     try:
         store.seed(manifest_rows, args.progress_refresh_seconds)
-        ids = list(dict.fromkeys(row[1] for row in manifest_rows))
-        with tqdm(total=len(ids), desc="Checking existing images", unit="ID", mininterval=args.progress_refresh_seconds) as progress:
-            for image_id in ids:
-                for number, parent, leaf in store.db.execute("SELECT number, parent, leaf FROM rows WHERE image_id = ? AND status != 'pending'", (image_id,)).fetchall():
-                    if paths is None or (parent, leaf) in paths:
-                        saved_path = store.db.execute("SELECT path FROM rows WHERE number = ?", (number,)).fetchone()[0]
-                        expected_folder = destination_folder(paths, output_dir, parent, leaf)
-                        if saved_path and Path(saved_path).parent != expected_folder:
-                            store.record(number, "pending")
-                for number, parent, leaf in store.pending_rows(image_id):
-                    if paths is not None and (parent, leaf) not in paths:
-                        store.record(number, "failed", error="Parent/leaf label pair absent from class tree")
-                        continue
-                    existing = existing_image(destination_folder(paths, output_dir, parent, leaf), image_id)
-                    if existing is not None:
-                        store.record(number, "existing", str(existing), str(existing))
-                progress.update(1)
-        pending = [image_id for image_id in ids if store.pending_rows(image_id)]
+        check_existing_images(store, manifest_rows, paths, output_dir, args.workers, args.progress_refresh_seconds)
+        pending = list(dict.fromkeys(
+            image_id for (image_id,) in store.db.execute(
+                "SELECT image_id FROM rows WHERE status = 'pending' ORDER BY number"
+            )
+        ))
         if args.max_image_ids is not None:
             pending = pending[:args.max_image_ids]
         print("Processing {} pending unique ImageIDs ({} manifest rows)".format(len(pending), len(manifest_rows)), flush=True)
