@@ -8,6 +8,4 @@ __pycache__/
 thumbs.db
 .DS_Store
 .idea
-my_code/data/OpenImages/Image IDs_with_captions_and_labels_captioned_only_test.csv
-my_code/data/OpenImages/Image IDs_with_captions_and_labels_captioned_only_train.csv
-my_code/data/OpenImages/Image IDs_with_captions_and_labels_captioned_only_validation.csv
+/my_code/data/OpenImages/
