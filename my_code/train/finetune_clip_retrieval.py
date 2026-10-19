@@ -328,9 +328,26 @@ def set_learning_rate(optimizer, base_lr, step, total_steps, warmup_steps):
     return lr
 
 
-def append_log(path, data):
+def get_summary_writer():
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+    except ImportError as exc:
+        raise RuntimeError(
+            "TensorBoard is required for training logs. Install it with "
+            "python -m pip install -r my_code/train/requirements.txt"
+        ) from exc
+    return SummaryWriter
+
+
+def append_log(path, data, writer=None):
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(data, ensure_ascii=False) + "\n")
+    if writer is not None:
+        step = data["step"]
+        for name, value in data.items():
+            if "/" in name and isinstance(value, (int, float)) and math.isfinite(value):
+                writer.add_scalar(name, value, step)
+        writer.flush()
 
 
 def save_checkpoint(path, model, optimizer, scaler, epoch, global_step, best_score, identity):
@@ -358,7 +375,7 @@ def load_checkpoint(path, model, optimizer, scaler, identity):
     return payload
 
 
-def train_epoch(model, dataset, args, device, precision, optimizer, scaler, epoch, global_step, total_steps, log_path):
+def train_epoch(model, dataset, args, device, precision, optimizer, scaler, epoch, global_step, total_steps, log_path, writer):
     model.train()
     dataset.epoch = epoch
     drop_singleton = len(dataset) % args.batch_size == 1
@@ -400,7 +417,7 @@ def train_epoch(model, dataset, args, device, precision, optimizer, scaler, epoc
                     "epoch": epoch + 1, "step": global_step, "train_step/loss_total": loss.item(),
                     "train_step/loss_i2t": image_loss.item(), "train_step/loss_t2i": text_loss.item(),
                     "train_step/lr": lr,
-                })
+                }, writer)
     return global_step, {
         "train_epoch/loss_total": (totals[0] / count).item(),
         "train_epoch/loss_i2t": (totals[1] / count).item(),
@@ -473,6 +490,7 @@ def evaluate(model, samples, caption_tokens, preprocess, args, device, precision
 
 def main(argv=None):
     args = parse_args(argv)
+    SummaryWriter = get_summary_writer()
     args.split_csv = args.split_csv.expanduser().resolve()
     args.caption_csv = args.caption_csv.expanduser().resolve()
     args.image_root = args.image_root.expanduser().resolve()
@@ -512,7 +530,7 @@ def main(argv=None):
         raise ValueError("Contrastive training needs at least two training images")
     optimizer = make_optimizer(model, args.lr, args.weight_decay)
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda" and precision == "fp16"))
-    if not args.resume and any((args.output_dir / name).exists() for name in ("best.pt", "last.pt", "metrics.jsonl")):
+    if not args.resume and any((args.output_dir / name).exists() for name in ("best.pt", "last.pt", "metrics.jsonl", "tensorboard")):
         raise FileExistsError("Output already contains a run; choose a new --output-dir or use --resume")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     config_path = args.output_dir / "config.json"
@@ -533,40 +551,44 @@ def main(argv=None):
         global_step = payload["global_step"]
         best_score = payload["best_score"]
         print("Resumed epoch {} at step {}".format(start_epoch, global_step), flush=True)
-    if args.eval_only:
-        for split in ("validation", "test"):
-            metrics = evaluate(model, by_split[split], caption_tokens, preprocess, args, device, precision, split)
-            print(json.dumps(metrics, indent=2), flush=True)
-        return
+    tensorboard_dir = args.output_dir / ("tensorboard_eval" if args.eval_only else "tensorboard")
+    with SummaryWriter(log_dir=str(tensorboard_dir),
+                       purge_step=global_step + 1 if args.resume and not args.eval_only else None) as writer:
+        if args.eval_only:
+            for split in ("validation", "test"):
+                metrics = evaluate(model, by_split[split], caption_tokens, preprocess, args, device, precision, split)
+                append_log(log_path, {"epoch": "eval_only", "step": global_step, **metrics}, writer)
+                print(json.dumps(metrics, indent=2), flush=True)
+            return
 
-    steps_per_epoch = (len(train_dataset) // args.batch_size if len(train_dataset) % args.batch_size == 1
-                       else math.ceil(len(train_dataset) / args.batch_size))
-    total_steps = args.epochs * steps_per_epoch
-    for epoch in range(start_epoch, args.epochs):
-        global_step, train_metrics = train_epoch(
-            model, train_dataset, args, device, precision, optimizer, scaler,
-            epoch, global_step, total_steps, log_path)
-        val_metrics = evaluate(model, by_split["validation"], caption_tokens, preprocess,
-                               args, device, precision, "validation")
-        metrics = {"epoch": epoch + 1, "step": global_step, **train_metrics, **val_metrics}
-        append_log(log_path, metrics)
-        print(json.dumps(metrics, indent=2), flush=True)
-        score = val_metrics["validation/mean_recall"]
-        if score > best_score:
-            best_score = score
-            save_checkpoint(args.output_dir / "best.pt", model, optimizer, scaler,
+        steps_per_epoch = (len(train_dataset) // args.batch_size if len(train_dataset) % args.batch_size == 1
+                           else math.ceil(len(train_dataset) / args.batch_size))
+        total_steps = args.epochs * steps_per_epoch
+        for epoch in range(start_epoch, args.epochs):
+            global_step, train_metrics = train_epoch(
+                model, train_dataset, args, device, precision, optimizer, scaler,
+                epoch, global_step, total_steps, log_path, writer)
+            val_metrics = evaluate(model, by_split["validation"], caption_tokens, preprocess,
+                                   args, device, precision, "validation")
+            metrics = {"epoch": epoch + 1, "step": global_step, **train_metrics, **val_metrics}
+            append_log(log_path, metrics, writer)
+            print(json.dumps(metrics, indent=2), flush=True)
+            score = val_metrics["validation/mean_recall"]
+            if score > best_score:
+                best_score = score
+                save_checkpoint(args.output_dir / "best.pt", model, optimizer, scaler,
+                                epoch, global_step, best_score, identity)
+            save_checkpoint(args.output_dir / "last.pt", model, optimizer, scaler,
                             epoch, global_step, best_score, identity)
-        save_checkpoint(args.output_dir / "last.pt", model, optimizer, scaler,
-                        epoch, global_step, best_score, identity)
-    best_path = args.output_dir / "best.pt"
-    if not best_path.is_file():
-        raise RuntimeError("No best checkpoint found; increase --epochs or check --resume")
-    if args.test_after_train:
-        load_checkpoint(best_path, model, optimizer, scaler, identity)
-        test_metrics = evaluate(model, by_split["test"], caption_tokens, preprocess,
-                                args, device, precision, "test")
-        append_log(log_path, {"epoch": "best", **test_metrics})
-        print(json.dumps(test_metrics, indent=2), flush=True)
+        best_path = args.output_dir / "best.pt"
+        if not best_path.is_file():
+            raise RuntimeError("No best checkpoint found; increase --epochs or check --resume")
+        if args.test_after_train:
+            load_checkpoint(best_path, model, optimizer, scaler, identity)
+            test_metrics = evaluate(model, by_split["test"], caption_tokens, preprocess,
+                                    args, device, precision, "test")
+            append_log(log_path, {"epoch": "best", "step": global_step, **test_metrics}, writer)
+            print(json.dumps(test_metrics, indent=2), flush=True)
     print("Outputs: {}".format(args.output_dir), flush=True)
 
 

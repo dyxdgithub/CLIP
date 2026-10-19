@@ -22,7 +22,7 @@ from tqdm import tqdm
 from finetune_clip_retrieval import (
     DATA_DIR, OUTPUT_DIR, Sample, append_log, assign_image_paths,
     autocast_context, choose_device, choose_precision, load_checkpoint,
-    load_pretrained, make_loader, make_optimizer, save_checkpoint,
+    get_summary_writer, load_pretrained, make_loader, make_optimizer, save_checkpoint,
     set_learning_rate, sha256_file, train_transform,
 )
 import clip
@@ -231,7 +231,7 @@ def mean_average_precision(scores, targets, masks):
 
 
 def train_epoch(model, dataset, class_tokens, optimizer, scaler, args,
-                device, precision, epoch, global_step, total_steps, log_path):
+                device, precision, epoch, global_step, total_steps, log_path, writer):
     model.train()
     loader = make_loader(dataset, args.batch_size, args.num_workers, True, args.seed + epoch)
     loss_sums = torch.zeros(3, dtype=torch.float64)
@@ -272,7 +272,7 @@ def train_epoch(model, dataset, class_tokens, optimizer, scaler, args,
                     "train_step/loss_positive": positive_loss.item(),
                     "train_step/loss_negative": negative_loss.item(),
                     "train_step/lr": lr,
-                })
+                }, writer)
     return global_step, {
         "train_epoch/loss_total": (loss_sums[0] / image_count).item(),
         "train_epoch/loss_positive": (loss_sums[1] / image_count).item(),
@@ -308,6 +308,7 @@ def evaluate(model, dataset, class_tokens, args, device, precision, split):
 
 def main(argv=None):
     args = parse_args(argv)
+    SummaryWriter = get_summary_writer()
     args.split_csv = args.split_csv.expanduser().resolve()
     args.image_root = args.image_root.expanduser().resolve()
     args.verified_labels_csv = args.verified_labels_csv.expanduser().resolve() if args.verified_labels_csv else None
@@ -349,7 +350,7 @@ def main(argv=None):
         "verified_labels_csv_sha256": sha256_file(args.verified_labels_csv) if args.verified_labels_csv else None,
         "label_policy": policy,
     }
-    if not args.resume and any((args.output_dir / name).exists() for name in ("best.pt", "last.pt", "metrics.jsonl")):
+    if not args.resume and any((args.output_dir / name).exists() for name in ("best.pt", "last.pt", "metrics.jsonl", "tensorboard")):
         raise FileExistsError("Output already contains a run; choose a new --output-dir or use --resume")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     if not args.resume:
@@ -370,36 +371,41 @@ def main(argv=None):
         global_step = payload["global_step"]
         best_score = payload["best_score"]
         print("Resumed epoch {} at step {}".format(start_epoch, global_step), flush=True)
-    if args.eval_only:
-        for split, dataset in (("validation", val_data), ("test", test_data)):
-            print(json.dumps(evaluate(model, dataset, class_tokens, args, device, precision, split), indent=2), flush=True)
-        return
-    total_steps = args.epochs * math.ceil(len(train_data) / args.batch_size)
-    for epoch in range(start_epoch, args.epochs):
-        global_step, train_metrics = train_epoch(
-            model, train_data, class_tokens, optimizer, scaler, args,
-            device, precision, epoch, global_step, total_steps, log_path)
-        val_metrics = evaluate(model, val_data, class_tokens, args, device, precision, "validation")
-        metrics = {"epoch": epoch + 1, "step": global_step, **train_metrics, **val_metrics}
-        append_log(log_path, metrics)
-        print(json.dumps(metrics, indent=2), flush=True)
-        score = val_metrics["validation/mAP_macro"]
-        if score is None:
-            raise ValueError("No validation class has both known positive and negative examples")
-        if score > best_score:
-            best_score = score
-            save_checkpoint(args.output_dir / "best.pt", model, optimizer, scaler,
+    tensorboard_dir = args.output_dir / ("tensorboard_eval" if args.eval_only else "tensorboard")
+    with SummaryWriter(log_dir=str(tensorboard_dir),
+                       purge_step=global_step + 1 if args.resume and not args.eval_only else None) as writer:
+        if args.eval_only:
+            for split, dataset in (("validation", val_data), ("test", test_data)):
+                metrics = evaluate(model, dataset, class_tokens, args, device, precision, split)
+                append_log(log_path, {"epoch": "eval_only", "step": global_step, **metrics}, writer)
+                print(json.dumps(metrics, indent=2), flush=True)
+            return
+        total_steps = args.epochs * math.ceil(len(train_data) / args.batch_size)
+        for epoch in range(start_epoch, args.epochs):
+            global_step, train_metrics = train_epoch(
+                model, train_data, class_tokens, optimizer, scaler, args,
+                device, precision, epoch, global_step, total_steps, log_path, writer)
+            val_metrics = evaluate(model, val_data, class_tokens, args, device, precision, "validation")
+            metrics = {"epoch": epoch + 1, "step": global_step, **train_metrics, **val_metrics}
+            append_log(log_path, metrics, writer)
+            print(json.dumps(metrics, indent=2), flush=True)
+            score = val_metrics["validation/mAP_macro"]
+            if score is None:
+                raise ValueError("No validation class has both known positive and negative examples")
+            if score > best_score:
+                best_score = score
+                save_checkpoint(args.output_dir / "best.pt", model, optimizer, scaler,
+                                epoch, global_step, best_score, identity)
+            save_checkpoint(args.output_dir / "last.pt", model, optimizer, scaler,
                             epoch, global_step, best_score, identity)
-        save_checkpoint(args.output_dir / "last.pt", model, optimizer, scaler,
-                        epoch, global_step, best_score, identity)
-    best_path = args.output_dir / "best.pt"
-    if not best_path.is_file():
-        raise RuntimeError("No best checkpoint found; increase --epochs or check --resume")
-    if args.test_after_train:
-        load_checkpoint(best_path, model, optimizer, scaler, identity)
-        test_metrics = evaluate(model, test_data, class_tokens, args, device, precision, "test")
-        append_log(log_path, {"epoch": "best", **test_metrics})
-        print(json.dumps(test_metrics, indent=2), flush=True)
+        best_path = args.output_dir / "best.pt"
+        if not best_path.is_file():
+            raise RuntimeError("No best checkpoint found; increase --epochs or check --resume")
+        if args.test_after_train:
+            load_checkpoint(best_path, model, optimizer, scaler, identity)
+            test_metrics = evaluate(model, test_data, class_tokens, args, device, precision, "test")
+            append_log(log_path, {"epoch": "best", "step": global_step, **test_metrics}, writer)
+            print(json.dumps(test_metrics, indent=2), flush=True)
     print("Outputs: {}".format(args.output_dir), flush=True)
 
 

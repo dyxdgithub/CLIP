@@ -7,6 +7,12 @@
 这份 8:1:1 划分来自原始 Open Images train 子集，报告结果时应称为自定义划分，
 不要称为官方测试集。
 
+训练日志需要 TensorBoard。在仓库根目录安装训练附加依赖：
+
+```bash
+python -m pip install -r my_code/train/requirements.txt
+```
+
 ## 图文检索
 
 ```bash
@@ -55,8 +61,16 @@ IMAGE_ROOT=/path/to/images_all \
   --epochs 10
 ```
 
-训练记录写入输出目录中的 `config.json`、`metrics.jsonl`、`last.pt`
-和 `best.pt`。脚本按 epoch 保存断点；从 `last.pt` 恢复时从下一轮继续。
+训练记录写入输出目录中的 `config.json`、`metrics.jsonl`、`tensorboard/`、
+`last.pt` 和 `best.pt`。TensorBoard 保存 step 损失与学习率、epoch 损失、
+验证损失和任务指标；执行测试时也保存测试指标。脚本按 epoch 保存断点；
+从 `last.pt` 恢复时从下一轮继续，并在 TensorBoard 中延续全局 step。
+`--eval-only` 的结果写入单独的 `tensorboard_eval/`，不会覆盖已有训练曲线。
+在仓库根目录查看所有训练曲线：
+
+```bash
+tensorboard --logdir my_code/train/output
+```
 确定最终配置后，可用
 `--eval-only --resume /path/to/best.pt` 评估验证集和测试集；
 也可在最终训练命令中显式添加 `--test-after-train`。
