@@ -3,6 +3,8 @@
 本文件适用于当前 CLIP 项目的 `my_code/`。包结构、公开 API、安装和现有测试说明见根目录的 [AGENTS.md](../AGENTS.md)。
 `my_code/` 用于本地训练、评测和数据实验；当前子目录为 `train/`、`test/`、`data/`。
 
+服务器上的项目根目录为 `/media/xyycyc/Elements1/dyx/CLIP`；训练图片按 CSV 中的 `RelativePath` 存放在其下的 `my_code/data/images_all/`，例如 `my_code/data/images_all/Aircraft/Fixed-wing aircraft/<ImageID>.jpg`。启动器使用仓库根目录推导默认图片路径，仍可通过 `IMAGE_ROOT` 覆盖。
+
 ## 1. 范围与代码位置
 
 - 只修改当前任务所需文件，不顺带改动无关目录。

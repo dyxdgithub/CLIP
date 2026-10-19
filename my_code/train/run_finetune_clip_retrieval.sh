@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
 
-: "${IMAGE_ROOT:?Set IMAGE_ROOT to the server directory containing the images}"
+IMAGE_ROOT="${IMAGE_ROOT:-$REPO_ROOT/my_code/data/images_all}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 MODEL_NAME="${MODEL_NAME:-ViT-B/32}"
 MODEL_SLUG="${MODEL_NAME//\//-}"

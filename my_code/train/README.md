@@ -10,8 +10,10 @@
 ## 图文检索
 
 ```bash
-IMAGE_ROOT=/path/to/images_all bash my_code/train/run_finetune_clip_retrieval.sh
+bash my_code/train/run_finetune_clip_retrieval.sh
 ```
+
+检索启动器默认从当前仓库的 `my_code/data/images_all` 读取图片；若服务器上的图片另存于其他位置，可在命令前设置 `IMAGE_ROOT=/path/to/images_all`。
 
 使用 `Image_IDs_n2_all_downloaded_split_8_1_1.csv` 的划分和
 `Image IDs_with_last_two_layers_multi_members_n2_one_label_per_parent.csv` 的 caption。
