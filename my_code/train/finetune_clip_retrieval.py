@@ -265,7 +265,11 @@ def choose_device(name):
     device = torch.device(name)
     if device.type == "cuda":
         if not torch.cuda.is_available():
-            raise RuntimeError("CUDA was selected but is unavailable")
+            raise RuntimeError(
+                "CUDA was selected but is unavailable (PyTorch CUDA build: {}, "
+                "CUDA_VISIBLE_DEVICES: {!r}). Check torch.cuda.is_available() "
+                "and the visible GPU IDs in this environment.".format(
+                    torch.version.cuda, os.environ.get("CUDA_VISIBLE_DEVICES")))
         torch.cuda.set_device(device)
     elif device.type != "cpu":
         raise ValueError("--device supports only CPU or CUDA")
@@ -490,7 +494,6 @@ def evaluate(model, samples, caption_tokens, preprocess, args, device, precision
 
 def main(argv=None):
     args = parse_args(argv)
-    SummaryWriter = get_summary_writer()
     args.split_csv = args.split_csv.expanduser().resolve()
     args.caption_csv = args.caption_csv.expanduser().resolve()
     args.image_root = args.image_root.expanduser().resolve()
@@ -530,6 +533,7 @@ def main(argv=None):
         raise ValueError("Contrastive training needs at least two training images")
     optimizer = make_optimizer(model, args.lr, args.weight_decay)
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda" and precision == "fp16"))
+    SummaryWriter = get_summary_writer()
     if not args.resume and any((args.output_dir / name).exists() for name in ("best.pt", "last.pt", "metrics.jsonl", "tensorboard")):
         raise FileExistsError("Output already contains a run; choose a new --output-dir or use --resume")
     args.output_dir.mkdir(parents=True, exist_ok=True)

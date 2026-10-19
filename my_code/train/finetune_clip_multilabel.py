@@ -308,7 +308,6 @@ def evaluate(model, dataset, class_tokens, args, device, precision, split):
 
 def main(argv=None):
     args = parse_args(argv)
-    SummaryWriter = get_summary_writer()
     args.split_csv = args.split_csv.expanduser().resolve()
     args.image_root = args.image_root.expanduser().resolve()
     args.verified_labels_csv = args.verified_labels_csv.expanduser().resolve() if args.verified_labels_csv else None
@@ -343,6 +342,7 @@ def main(argv=None):
     test_data = ImageLabelDataset(by_split["test"], targets, negatives, len(labels), preprocess)
     optimizer = make_optimizer(model, args.lr, args.weight_decay)
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda" and precision == "fp16"))
+    SummaryWriter = get_summary_writer()
     identity = {
         "task": "multilabel",
         "model": args.model,
