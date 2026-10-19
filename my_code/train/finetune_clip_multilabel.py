@@ -335,7 +335,6 @@ def main(argv=None):
     if device.type == "cuda":
         torch.cuda.manual_seed_all(args.seed)
     model, preprocess = load_pretrained(args.model, device, args.download_root)
-    model.float()
     class_tokens = clip.tokenize(["a photo of a {}.".format(name) for name in class_names], truncate=True).to(device)
     train_data = ImageLabelDataset(by_split["train"], targets, negatives, len(labels),
                                    train_transform(model.visual.input_resolution))

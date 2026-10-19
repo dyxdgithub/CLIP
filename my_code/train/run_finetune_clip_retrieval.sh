@@ -11,10 +11,13 @@ MODEL_NAME="${MODEL_NAME:-ViT-B/32}"
 MODEL_SLUG="${MODEL_NAME//\//-}"
 IMAGE_LAYOUT="${IMAGE_LAYOUT:-relative}"
 OUTPUT_PATH="${OUTPUT_PATH:-$SCRIPT_DIR/output/clip_retrieval_$MODEL_SLUG}"
-DEVICE="${DEVICE:-auto}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-3}"
+DEVICE="${DEVICE:-cuda:0}"
 PRECISION="${PRECISION:-auto}"
 EPOCHS="${EPOCHS:-5}"
-BATCH_SIZE="${BATCH_SIZE:-64}"
+BATCH_SIZE="${BATCH_SIZE:-8}"
+EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-16}"
+SCORE_BATCH_SIZE="${SCORE_BATCH_SIZE:-128}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 LEARNING_RATE="${LEARNING_RATE:-1e-5}"
 SEED="${SEED:-42}"
@@ -30,6 +33,8 @@ SEED="${SEED:-42}"
   --precision "$PRECISION" \
   --epochs "$EPOCHS" \
   --batch-size "$BATCH_SIZE" \
+  --eval-batch-size "$EVAL_BATCH_SIZE" \
+  --score-batch-size "$SCORE_BATCH_SIZE" \
   --num-workers "$NUM_WORKERS" \
   --lr "$LEARNING_RATE" \
   --seed "$SEED" \

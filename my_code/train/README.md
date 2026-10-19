@@ -62,3 +62,6 @@ IMAGE_ROOT=/path/to/images_all \
 也可在最终训练命令中显式添加 `--test-after-train`。
 单卡显存不足时可调小 `BATCH_SIZE`；检索任务的批大小也决定了每一步的
 批内负例数，因此调整批大小须在实验记录中说明。
+若在模型加载阶段就出现 CUDA out of memory，先运行 `nvidia-smi` 检查显存占用，
+通过 `DEVICE=cuda:N` 选择有足够空闲显存的 GPU 或释放该卡上的其他任务；
+此时训练尚未开始，调小 `BATCH_SIZE` 不能解决模型加载失败。

@@ -237,7 +237,7 @@ def load_pretrained(name, device, download_root):
         except (RuntimeError, ValueError):
             state_dict = None  # A JIT archive is handled by clip.load below.
         if isinstance(state_dict, dict):
-            model = build_model(state_dict).to(device)
+            model = build_model(state_dict).float()
             size = model.visual.input_resolution
             preprocess = transforms.Compose([
                 transforms.Resize(size, interpolation=transforms.InterpolationMode.BICUBIC),
@@ -246,8 +246,11 @@ def load_pretrained(name, device, download_root):
                 transforms.ToTensor(),
                 transforms.Normalize(CLIP_MEAN, CLIP_STD),
             ])
-            return model, preprocess
-    return clip.load(name, device=device, jit=False, download_root=str(download_root) if download_root else None)
+            return model.to(device), preprocess
+    model, preprocess = clip.load(
+        name, device="cpu", jit=False,
+        download_root=str(download_root) if download_root else None)
+    return model.to(device), preprocess
 
 
 def make_loader(dataset, batch_size, workers, shuffle, seed, drop_last=False):
@@ -486,20 +489,23 @@ def main(argv=None):
     assign_image_paths(by_split, args.image_root, args.image_layout, not args.skip_file_check)
     print("Images: {}; unique captions: {}".format(
         {split: len(samples) for split, samples in by_split.items()}, len(captions)), flush=True)
+    device = choose_device(args.device)
+    precision = choose_precision(args.precision, device)
+    if device.type == "cuda":
+        free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+        print("CUDA {}: {:.2f} GiB free / {:.2f} GiB total before model load".format(
+            device, free_bytes / 1024 ** 3, total_bytes / 1024 ** 3), flush=True)
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(args.seed)
+    model, preprocess = load_pretrained(args.model, device, args.download_root)
     caption_tokens = tokenize_captions(captions)
     identity = {
         "model": args.model,
         "split_csv_sha256": sha256_file(args.split_csv),
         "caption_csv_sha256": sha256_file(args.caption_csv),
     }
-    device = choose_device(args.device)
-    precision = choose_precision(args.precision, device)
-    random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    if device.type == "cuda":
-        torch.cuda.manual_seed_all(args.seed)
-    model, preprocess = load_pretrained(args.model, device, args.download_root)
-    model.float()  # Keep optimizer/master parameters in fp32; autocast handles CUDA compute.
     train_dataset = ImageTextDataset(by_split["train"], caption_tokens,
                                      train_transform(model.visual.input_resolution), args.seed)
     if len(train_dataset) < 2:
