@@ -10,6 +10,14 @@ PYTHON_BIN="${PYTHON_BIN:-python}"
 MODEL_NAME="${MODEL_NAME:-ViT-B/32}"
 MODEL_SLUG="${MODEL_NAME//\//-}"
 IMAGE_LAYOUT="${IMAGE_LAYOUT:-relative}"
+ALLOW_TRUNCATED_IMAGES="${ALLOW_TRUNCATED_IMAGES:-1}"
+TRUNCATED_IMAGE_ARGS=()
+if [[ "$ALLOW_TRUNCATED_IMAGES" == "1" ]]; then
+  TRUNCATED_IMAGE_ARGS+=(--allow-truncated-images)
+elif [[ "$ALLOW_TRUNCATED_IMAGES" != "0" ]]; then
+  echo "ALLOW_TRUNCATED_IMAGES must be 0 or 1" >&2
+  exit 2
+fi
 OUTPUT_PATH="${OUTPUT_PATH:-$SCRIPT_DIR/output/clip_multilabel_$MODEL_SLUG}"
 DEVICE="${DEVICE:-auto}"
 PRECISION="${PRECISION:-auto}"
@@ -23,6 +31,7 @@ SEED="${SEED:-42}"
   --split-csv my_code/data/Image_IDs_n2_all_downloaded_split_8_1_1.csv \
   --image-root "$IMAGE_ROOT" \
   --image-layout "$IMAGE_LAYOUT" \
+  "${TRUNCATED_IMAGE_ARGS[@]}" \
   --output-dir "$OUTPUT_PATH" \
   --model "$MODEL_NAME" \
   --device "$DEVICE" \

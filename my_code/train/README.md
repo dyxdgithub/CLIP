@@ -4,6 +4,10 @@
 `<IMAGE_ROOT>/<RelativePath>`，例如
 `<IMAGE_ROOT>/Aircraft/Fixed-wing aircraft/0000a90019e380dc.jpg`。
 启动时会检查每个 ImageID 是否至少有一个对应图片；可用 `--skip-file-check` 跳过预检。
+启动器默认设置 `ALLOW_TRUNCATED_IMAGES=1`：严格解码失败且 Pillow 明确报告图片截断时，
+会重试读取并在终端警告中显示文件路径；这类图片的缺失像素可能影响数据质量。
+需要严格拒绝截断图片时，设 `ALLOW_TRUNCATED_IMAGES=0`。无法恢复的图片仍会带路径报错，
+应据此重新下载或修复源文件。该策略记录在运行的 `config.json` 中。
 这份 8:1:1 划分来自原始 Open Images train 子集，报告结果时应称为自定义划分，
 不要称为官方测试集。
 
@@ -65,6 +69,8 @@ IMAGE_ROOT=/path/to/images_all \
 `last.pt` 和 `best.pt`。TensorBoard 保存 step 损失与学习率、epoch 损失、
 验证损失和任务指标；执行测试时也保存测试指标。脚本按 epoch 保存断点；
 从 `last.pt` 恢复时从下一轮继续，并在 TensorBoard 中延续全局 step。
+若在首个 epoch 完成前失败，尚无 checkpoint；重新运行时应设置新的 `OUTPUT_PATH`，
+保留旧目录中的诊断日志。
 `--eval-only` 的结果写入单独的 `tensorboard_eval/`，不会覆盖已有训练曲线。
 在仓库根目录查看所有训练曲线：
 

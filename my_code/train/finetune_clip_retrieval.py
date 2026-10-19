@@ -16,6 +16,7 @@ import os
 import random
 import re
 import sys
+import warnings
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -30,7 +31,7 @@ package_spec.loader.exec_module(clip)
 import torch
 import torch.nn.functional as F
 from clip.model import build_model
-from PIL import Image
+from PIL import Image, ImageFile
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from tqdm import tqdm
@@ -65,6 +66,8 @@ def parse_args(argv=None):
                         help="How to find images below --image-root. Default: %(default)s.")
     parser.add_argument("--skip-file-check", action="store_true",
                         help="Skip startup existence checks; missing files will fail during loading.")
+    parser.add_argument("--allow-truncated-images", action="store_true",
+                        help="Retry images rejected as truncated with Pillow's partial-image decoder; recovered paths are warned.")
     parser.add_argument("--model", default="ViT-B/32",
                         help="Name from clip.available_models() or a pretrained CLIP state-dict path. Default: %(default)s.")
     parser.add_argument("--download-root", type=Path,
@@ -202,12 +205,38 @@ def tokenize_captions(captions):
     return torch.cat(pieces, dim=0)
 
 
+_WARNED_TRUNCATED_PATHS = set()
+
+
+def load_rgb_image(path, allow_truncated=False):
+    try:
+        with Image.open(path) as image:
+            return image.convert("RGB")
+    except OSError as exc:
+        if not allow_truncated or "truncated" not in str(exc).lower():
+            raise OSError("Cannot decode image {}: {}".format(path, exc)) from exc
+    previous = ImageFile.LOAD_TRUNCATED_IMAGES
+    try:
+        ImageFile.LOAD_TRUNCATED_IMAGES = True
+        with Image.open(path) as image:
+            pixels = image.convert("RGB")
+    except OSError as exc:
+        raise OSError("Cannot decode truncated image {}: {}".format(path, exc)) from exc
+    finally:
+        ImageFile.LOAD_TRUNCATED_IMAGES = previous
+    if path not in _WARNED_TRUNCATED_PATHS:
+        warnings.warn("Recovered truncated image; pixels may be incomplete: {}".format(path), RuntimeWarning)
+        _WARNED_TRUNCATED_PATHS.add(path)
+    return pixels
+
+
 class ImageTextDataset(Dataset):
-    def __init__(self, samples, caption_tokens, transform, seed):
+    def __init__(self, samples, caption_tokens, transform, seed, allow_truncated=False):
         self.samples = samples
         self.caption_tokens = caption_tokens
         self.transform = transform
         self.seed = seed
+        self.allow_truncated = allow_truncated
         self.epoch = 0
 
     def __len__(self):
@@ -217,8 +246,7 @@ class ImageTextDataset(Dataset):
         sample = self.samples[index]
         caption_indices = sample.caption_indices
         caption_index = caption_indices[(self.seed + self.epoch + index) % len(caption_indices)]
-        with Image.open(sample.image_path) as image:
-            pixels = self.transform(image.convert("RGB"))
+        pixels = self.transform(load_rgb_image(sample.image_path, self.allow_truncated))
         return pixels, self.caption_tokens[caption_index], caption_index
 
 
@@ -447,7 +475,7 @@ def recall_at_k(query_features, candidate_features, positives, device, block_siz
 @torch.no_grad()
 def evaluate(model, samples, caption_tokens, preprocess, args, device, precision, split):
     model.eval()
-    dataset = ImageTextDataset(samples, caption_tokens, preprocess, args.seed)
+    dataset = ImageTextDataset(samples, caption_tokens, preprocess, args.seed, args.allow_truncated_images)
     loader = make_loader(dataset, args.eval_batch_size, args.num_workers, False, args.seed)
     image_features = []
     loss_total = 0.0
@@ -528,7 +556,8 @@ def main(argv=None):
         "caption_csv_sha256": sha256_file(args.caption_csv),
     }
     train_dataset = ImageTextDataset(by_split["train"], caption_tokens,
-                                     train_transform(model.visual.input_resolution), args.seed)
+                                     train_transform(model.visual.input_resolution), args.seed,
+                                     args.allow_truncated_images)
     if len(train_dataset) < 2:
         raise ValueError("Contrastive training needs at least two training images")
     optimizer = make_optimizer(model, args.lr, args.weight_decay)

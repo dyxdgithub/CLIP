@@ -15,15 +15,14 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
-from PIL import Image
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
 from finetune_clip_retrieval import (
     DATA_DIR, OUTPUT_DIR, Sample, append_log, assign_image_paths,
     autocast_context, choose_device, choose_precision, load_checkpoint,
-    get_summary_writer, load_pretrained, make_loader, make_optimizer, save_checkpoint,
-    set_learning_rate, sha256_file, train_transform,
+    get_summary_writer, load_pretrained, load_rgb_image, make_loader, make_optimizer,
+    save_checkpoint, set_learning_rate, sha256_file, train_transform,
 )
 import clip
 
@@ -41,6 +40,8 @@ def parse_args(argv=None):
                         help="How to find images below --image-root. Default: %(default)s.")
     parser.add_argument("--skip-file-check", action="store_true",
                         help="Skip startup existence checks; missing files will fail during loading.")
+    parser.add_argument("--allow-truncated-images", action="store_true",
+                        help="Retry images rejected as truncated with Pillow's partial-image decoder; recovered paths are warned.")
     parser.add_argument("--model", default="ViT-B/32",
                         help="Name from clip.available_models() or a pretrained CLIP state-dict path. Default: %(default)s.")
     parser.add_argument("--download-root", type=Path, help="Pretrained CLIP weight cache.")
@@ -162,20 +163,20 @@ def read_verified_labels(path, targets, label_to_index):
 
 
 class ImageLabelDataset(Dataset):
-    def __init__(self, samples, targets, negatives, class_count, transform):
+    def __init__(self, samples, targets, negatives, class_count, transform, allow_truncated=False):
         self.samples = samples
         self.targets = targets
         self.negatives = negatives
         self.class_count = class_count
         self.transform = transform
+        self.allow_truncated = allow_truncated
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, index):
         sample = self.samples[index]
-        with Image.open(sample.image_path) as image:
-            pixels = self.transform(image.convert("RGB"))
+        pixels = self.transform(load_rgb_image(sample.image_path, self.allow_truncated))
         target = torch.zeros(self.class_count, dtype=torch.float32)
         positive = list(self.targets[sample.image_id])
         target[positive] = 1
@@ -337,9 +338,11 @@ def main(argv=None):
     model, preprocess = load_pretrained(args.model, device, args.download_root)
     class_tokens = clip.tokenize(["a photo of a {}.".format(name) for name in class_names], truncate=True).to(device)
     train_data = ImageLabelDataset(by_split["train"], targets, negatives, len(labels),
-                                   train_transform(model.visual.input_resolution))
-    val_data = ImageLabelDataset(by_split["validation"], targets, negatives, len(labels), preprocess)
-    test_data = ImageLabelDataset(by_split["test"], targets, negatives, len(labels), preprocess)
+                                   train_transform(model.visual.input_resolution), args.allow_truncated_images)
+    val_data = ImageLabelDataset(by_split["validation"], targets, negatives, len(labels), preprocess,
+                                 args.allow_truncated_images)
+    test_data = ImageLabelDataset(by_split["test"], targets, negatives, len(labels), preprocess,
+                                  args.allow_truncated_images)
     optimizer = make_optimizer(model, args.lr, args.weight_decay)
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda" and precision == "fp16"))
     SummaryWriter = get_summary_writer()
