@@ -1,6 +1,6 @@
 """Download Open Images in order: FiftyOne, TFDS, then ImageID URLs.
 
-By default, the three AllSet captioned manifests are processed separately.
+By default, the three OpenImages captioned manifests are processed separately.
 Hierarchy layout places each row in its parent/leaf folder. Flat layout saves
 one image per ImageID in a split folder. A SQLite checkpoint records progress;
 each final CSV identifies the source or failure. Run again to retry incomplete
@@ -26,19 +26,13 @@ from tqdm import tqdm
 
 
 META_DIR = Path(__file__).resolve().parent.parent
-N2_DIR = META_DIR / "Hierarchy" / "n2"
-SAMPLED_DIR = N2_DIR / "300"
-ALLSET_DIR = META_DIR / "AllSet"
-DEFAULT_INPUT = SAMPLED_DIR / "Image IDs_with_last_two_layers_multi_members_n2_one_label_per_parent_sampled_300_per_class.csv"
-DEFAULT_TREE = N2_DIR / "Last_Two_Layers_Multi_Members_n2.json"
-DEFAULT_OUTPUT = SAMPLED_DIR / "images_fiftyone_sampled_300_per_class"
-DEFAULT_STATUS = SAMPLED_DIR / "n2_sampled_download_status.csv"
-ALLSET_INPUTS = {
-    split: ALLSET_DIR / "Image IDs_with_captions_and_labels_captioned_only_{}.csv".format(split)
+OPENIMAGES_DIR = META_DIR / "OpenImages"
+SPLIT_FOLDERS = {"train": "train", "test": "test", "validation": "val"}
+OPENIMAGES_INPUTS = {
+    split: OPENIMAGES_DIR / "Image IDs_with_captions_and_labels_captioned_only_{}.csv".format(split)
     for split in ("train", "test", "validation")
 }
-ALLSET_OUTPUT = ALLSET_DIR / "images_captioned_only"
-ALLSET_STATUS = ALLSET_DIR / "captioned_only_download_status.csv"
+OPENIMAGES_STATUS = OPENIMAGES_DIR / "captioned_only_download_status.csv"
 DEFAULT_S3 = "https://open-images-dataset.s3.amazonaws.com/{split}/{image_id}.jpg"
 SUFFIXES = {"JPEG": ".jpg", "PNG": ".png", "WEBP": ".webp", "BMP": ".bmp"}
 STATUS_FIELDS = ("DownloadStatus", "DownloadSource", "DownloadedImagePath", "DownloadError")
@@ -47,11 +41,11 @@ DONE = {"existing", "fiftyone", "tfds", "s3", "original_url", "thumbnail_url"}
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--layout", choices=("hierarchy", "flat"), default="flat", help="flat downloads AllSet by ImageID; hierarchy requires parent/leaf labels. Default: %(default)s")
-    parser.add_argument("--input", type=Path, help="Single original manifest CSV. If omitted, flat processes the train, test, and validation AllSet CSVs; hierarchy uses sampled n2.")
-    parser.add_argument("--class-tree", type=Path, default=DEFAULT_TREE, help="n2 class-tree JSON; ignored for flat layout. Default: %(default)s")
-    parser.add_argument("--output-dir", type=Path, help="Image directory. Flat three-file mode uses train/, test/, validation/ subdirectories. Default: sampled n2 hierarchy or AllSet/images_captioned_only for flat.")
-    parser.add_argument("--status-output", type=Path, help="Status CSV path. Flat three-file mode adds _train, _test, or _validation before the suffix. Default: n2 sampled or AllSet status path.")
+    parser.add_argument("--layout", choices=("hierarchy", "flat"), default="flat", help="flat downloads OpenImages by ImageID; hierarchy requires parent/leaf labels. Default: %(default)s")
+    parser.add_argument("--input", type=Path, help="Single original manifest CSV. If omitted, flat processes the three OpenImages CSVs; required for hierarchy.")
+    parser.add_argument("--class-tree", type=Path, help="Class-tree JSON; required for hierarchy and ignored for flat layout.")
+    parser.add_argument("--output-dir", type=Path, help="Image directory. Flat mode uses OpenImages/train, test, and val for the built-in manifests; a custom flat --input requires this option. Hierarchy defaults to OpenImages/hierarchy.")
+    parser.add_argument("--status-output", type=Path, help="Status CSV path. Built-in flat manifests add a split suffix; hierarchy defaults to OpenImages/hierarchy_download_status.csv.")
     parser.add_argument("--checkpoint-db", type=Path, help="SQLite checkpoint. Flat three-file mode adds a split suffix; default: hidden database beside each status CSV.")
     parser.add_argument("--split", choices=("auto", "train", "validation", "test"), help="FiftyOne, TFDS, and S3 split. auto reads --subset-column and is required for flat three-file mode; default: train for hierarchy, auto for flat.")
     parser.add_argument("--subset-column", default="Subset", help="Split column when --split auto is used; accepts train, validation, test. Default: %(default)s")
@@ -61,7 +55,7 @@ def parse_args(argv=None):
     parser.add_argument("--fiftyone-batch-size", type=int, default=500, help="Unique IDs requested per FiftyOne call. Default: %(default)s")
     parser.add_argument("--workers", type=int, default=16, help="FiftyOne and URL download workers. Default: %(default)s")
     parser.add_argument("--tfds-name", default="open_images_v4/200k", help="TFDS builder/configuration. Default: %(default)s")
-    parser.add_argument("--tfds-data-dir", type=Path, help="TFDS prepared-data directory. Default: n2/tfds_open_images_v4 for hierarchy; AllSet/tfds_open_images_v4 for flat.")
+    parser.add_argument("--tfds-data-dir", type=Path, help="TFDS prepared-data directory. Default: OpenImages/tfds_open_images_v4.")
     parser.add_argument("--download-tfds-data", action="store_true", help="Allow TFDS to prepare/download missing data; this may require substantial disk space. Default: false.")
     parser.add_argument("--tfds-image-id-key", default="auto", help="TFDS ID feature; auto tries image_id, image/filename, image_filename, id. Default: %(default)s")
     parser.add_argument("--source-url-template", action="append", help="ImageID URL template; repeatable, with {split} and {image_id}. Default: Open Images S3 URL.")
@@ -79,18 +73,32 @@ def parse_args(argv=None):
     parser.add_argument("--max-image-ids", type=int, help="Process only the first N pending unique IDs per manifest; remaining IDs stay pending. Default: all.")
     parser.add_argument("--progress-refresh-seconds", type=float, default=0.1, help="Minimum tqdm refresh interval in seconds. Default: %(default)s")
     args = parser.parse_args(argv)
-    if args.input is None and args.layout == "hierarchy":
-        args.input = DEFAULT_INPUT
-    if args.output_dir is None:
-        args.output_dir = ALLSET_OUTPUT if args.layout == "flat" else DEFAULT_OUTPUT
-    if args.status_output is None:
-        args.status_output = ALLSET_STATUS if args.layout == "flat" else DEFAULT_STATUS
+    if args.layout == "hierarchy" and (args.input is None or args.class_tree is None):
+        parser.error("--input and --class-tree are required for hierarchy layout")
+    input_split = next(
+        (split for split, path in OPENIMAGES_INPUTS.items()
+         if args.layout == "flat" and args.input is not None and args.input.expanduser().resolve() == path.resolve()),
+        None,
+    )
+    if args.layout == "flat":
+        if args.output_dir is None:
+            if args.input is not None and input_split is None:
+                parser.error("--output-dir is required with a custom flat --input")
+            args.output_dir = OPENIMAGES_DIR / SPLIT_FOLDERS[input_split] if input_split else OPENIMAGES_DIR
+        if args.status_output is None:
+            args.status_output = (OPENIMAGES_STATUS.with_name("{}_{}{}".format(OPENIMAGES_STATUS.stem, input_split, OPENIMAGES_STATUS.suffix))
+                                  if input_split else OPENIMAGES_STATUS)
+    else:
+        if args.output_dir is None:
+            args.output_dir = OPENIMAGES_DIR / "hierarchy"
+        if args.status_output is None:
+            args.status_output = OPENIMAGES_DIR / "hierarchy_download_status.csv"
     if args.tfds_data_dir is None:
-        args.tfds_data_dir = (ALLSET_DIR if args.layout == "flat" else N2_DIR) / "tfds_open_images_v4"
+        args.tfds_data_dir = OPENIMAGES_DIR / "tfds_open_images_v4"
     if args.split is None:
         args.split = "auto" if args.layout == "flat" else "train"
     if args.layout == "flat" and args.input is None and args.split != "auto":
-        parser.error("--split must be auto when processing all three AllSet manifests")
+        parser.error("--split must be auto when processing all three OpenImages manifests")
     for name in ("fiftyone_batch_size", "workers", "url_retries"):
         if getattr(args, name) <= 0:
             parser.error("--{} must be positive".format(name.replace("_", "-")))
@@ -458,7 +466,7 @@ def url_stage(ids, metadata_urls, store, paths, output_dir, args):
 
 def process_manifest(args, expected_split=None):
     input_path = args.input.expanduser().resolve()
-    tree_path = args.class_tree.expanduser().resolve()
+    tree_path = args.class_tree.expanduser().resolve() if args.layout == "hierarchy" else None
     output_dir = args.output_dir.expanduser().resolve()
     status_path = args.status_output.expanduser().resolve()
     checkpoint = args.checkpoint_db.expanduser().resolve() if args.checkpoint_db else status_path.with_name("." + status_path.stem + "_checkpoint.sqlite3")
@@ -470,7 +478,7 @@ def process_manifest(args, expected_split=None):
     fields, manifest_rows, metadata_urls, splits = read_manifest(input_path, args)
     if expected_split is not None and any(split != expected_split for split in splits.values()):
         raise ValueError("{} contains an ImageID outside the {} split".format(input_path, expected_split))
-    paths = load_leaf_paths(tree_path, args) if args.layout == "hierarchy" else None
+    paths = load_leaf_paths(tree_path, args) if tree_path is not None else None
     store = DownloadStore(checkpoint)
     try:
         store.seed(manifest_rows, args.progress_refresh_seconds)
@@ -523,14 +531,14 @@ def main(argv=None):
     if args.input is not None:
         return process_manifest(args)
     result = 0
-    for split, input_path in ALLSET_INPUTS.items():
+    for split, input_path in OPENIMAGES_INPUTS.items():
         task = argparse.Namespace(**vars(args))
         task.input = input_path
-        task.output_dir = args.output_dir / split
+        task.output_dir = args.output_dir / SPLIT_FOLDERS[split]
         task.status_output = split_path(args.status_output, split)
         if args.checkpoint_db is not None:
             task.checkpoint_db = split_path(args.checkpoint_db, split)
-        print("Processing AllSet {}: {}".format(split, input_path), flush=True)
+        print("Processing OpenImages {}: {}".format(split, input_path), flush=True)
         result = max(result, process_manifest(task, expected_split=split))
     return result
 
