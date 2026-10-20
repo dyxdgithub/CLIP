@@ -1,10 +1,10 @@
-"""Download Open Images in order: FiftyOne, TFDS, then ImageID URLs.
+"""Download each Open Image through FiftyOne, TFDS, then ImageID URLs.
 
 By default, the three OpenImages captioned manifests are processed separately.
 Hierarchy layout places each row in its parent/leaf folder. Flat layout saves
 one image per ImageID in a split folder. A SQLite checkpoint records progress;
-each final CSV identifies the source or failure. Run again to retry incomplete
-rows.
+each final CSV identifies the source or failure. Interrupted images resume at
+the next untried source; use --retry-failed to retry exhausted sources.
 """
 
 import argparse
@@ -51,10 +51,10 @@ def parse_args(argv=None):
     parser.add_argument("--split", choices=("auto", "train", "validation", "test"), help="FiftyOne, TFDS, and S3 split. auto reads --subset-column and is required for flat three-file mode; default: train for hierarchy, auto for flat.")
     parser.add_argument("--subset-column", default="Subset", help="Split column when --split auto is used; accepts train, validation, test. Default: %(default)s")
     parser.add_argument("--zoo-dataset", default="open-images-v7", help="FiftyOne Zoo dataset. Default: %(default)s")
-    parser.add_argument("--fiftyone-dataset-name", default="tinyclip_n2_fallback", help="Prefix for per-batch FiftyOne dataset names. Default: %(default)s")
+    parser.add_argument("--fiftyone-dataset-name", default="tinyclip_n2_fallback", help="Prefix for per-image FiftyOne dataset names. Default: %(default)s")
     parser.add_argument("--dataset-dir", type=Path, help="FiftyOne cache directory. Default: FiftyOne's configured directory.")
-    parser.add_argument("--fiftyone-batch-size", type=int, default=1000, help="Unique IDs requested per FiftyOne call. Default: %(default)s")
-    parser.add_argument("--workers", type=int, default=128, help="Existing-image checks, FiftyOne, and URL download workers. Default: %(default)s")
+    parser.add_argument("--fiftyone-batch-size", type=int, default=1, help="Deprecated compatibility option; each FiftyOne call now requests exactly one ID.")
+    parser.add_argument("--workers", type=int, default=128, help="Existing-image check workers; downloads proceed one image at a time. Default: %(default)s")
     parser.add_argument("--tfds-name", default="open_images_v4/200k", help="TFDS builder/configuration. Default: %(default)s")
     parser.add_argument("--tfds-data-dir", type=Path, help="TFDS prepared-data directory. Default: OpenImages/tfds_open_images_v4.")
     parser.add_argument("--download-tfds-data", action="store_true", help="Allow TFDS to prepare/download missing data; this may require substantial disk space. Default: false.")
@@ -72,6 +72,7 @@ def parse_args(argv=None):
     parser.add_argument("--url-retries", type=int, default=3, help="Attempts per URL. Default: %(default)s")
     parser.add_argument("--url-backoff", type=float, default=1, help="Base exponential retry delay in seconds. Default: %(default)s")
     parser.add_argument("--max-image-ids", type=int, help="Process only the first N pending unique IDs per manifest; remaining IDs stay pending. Default: all.")
+    parser.add_argument("--retry-failed", action="store_true", help="Retry previously failed images and clear recorded source failures. Default: skip them.")
     parser.add_argument("--progress-refresh-seconds", type=float, default=0.1, help="Minimum tqdm refresh interval in seconds. Default: %(default)s")
     args = parser.parse_args(argv)
     if args.layout == "hierarchy" and (args.input is None or args.class_tree is None):
@@ -173,6 +174,10 @@ class DownloadStore:
         path.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(path)
         self.db.execute("CREATE TABLE IF NOT EXISTS rows (number INTEGER PRIMARY KEY, image_id TEXT NOT NULL, parent TEXT NOT NULL, leaf TEXT NOT NULL, status TEXT NOT NULL, source TEXT NOT NULL, path TEXT NOT NULL, error TEXT NOT NULL)")
+        self.db.execute("CREATE INDEX IF NOT EXISTS rows_image_id_status ON rows (image_id, status)")
+        self.db.execute("CREATE TABLE IF NOT EXISTS source_failures (image_id TEXT NOT NULL, source_key TEXT NOT NULL, PRIMARY KEY (image_id, source_key))")
+        self.db.execute("CREATE TABLE IF NOT EXISTS tfds_index (cache_key TEXT NOT NULL, image_id TEXT NOT NULL, position INTEGER NOT NULL, PRIMARY KEY (cache_key, image_id))")
+        self.db.execute("CREATE TABLE IF NOT EXISTS tfds_index_ready (cache_key TEXT PRIMARY KEY, example_count INTEGER NOT NULL)")
         self.db.commit()
 
     def seed(self, manifest_rows, refresh_seconds):
@@ -192,8 +197,24 @@ class DownloadStore:
                     batch = manifest_rows[offset:offset + 5000]
                     self.db.executemany("INSERT INTO rows VALUES (?, ?, ?, ?, 'pending', '', '', '')", batch)
                     progress.update(len(batch))
-        # Failed rows are retried; check_existing_images validates completed paths once.
+        self.db.commit()
+
+    def retry_failed(self):
+        self.db.execute("DELETE FROM source_failures")
         self.db.execute("UPDATE rows SET status = 'pending', source = '', path = '', error = '' WHERE status = 'failed'")
+        self.db.execute("UPDATE rows SET error = '' WHERE status = 'pending'")
+        self.db.commit()
+
+    def failed_sources(self, image_id):
+        return {key for (key,) in self.db.execute(
+            "SELECT source_key FROM source_failures WHERE image_id = ?", (image_id,)
+        )}
+
+    def mark_source_failed(self, image_id, source_key):
+        self.db.execute(
+            "INSERT OR IGNORE INTO source_failures (image_id, source_key) VALUES (?, ?)",
+            (image_id, source_key),
+        )
         self.db.commit()
 
     def pending_rows(self, image_id):
@@ -384,43 +405,33 @@ def apply_source(image_id, source_path, source_kind, source_label, store, paths,
             store.add_error(image_id, "{} copy: {}".format(source_kind, error))
 
 
-def fiftyone_stage(ids, store, paths, output_dir, args):
-    if not ids:
-        return
+def fiftyone_one(image_id, store, paths, output_dir, args):
     try:
         import fiftyone.zoo as foz
     except Exception as error:
-        print("FiftyOne unavailable; continuing with TFDS: {}".format(error), flush=True)
-        for image_id in ids:
-            store.add_error(image_id, "FiftyOne unavailable: {}".format(error))
+        store.add_error(image_id, "FiftyOne unavailable: {}".format(error))
         return
-    with tqdm(total=len(ids), desc="FiftyOne", unit="ID", mininterval=args.progress_refresh_seconds) as progress:
-        for offset in range(0, len(ids), args.fiftyone_batch_size):
-            batch = [image_id for image_id in ids[offset:offset + args.fiftyone_batch_size] if store.pending_rows(image_id)]
-            if not batch:
-                progress.update(min(args.fiftyone_batch_size, len(ids) - offset))
-                continue
-            batch_hash = hashlib.sha1((args.split + "\n" + "\n".join(batch)).encode("utf-8")).hexdigest()[:12]
-            kwargs = dict(split=args.split, label_types=[], image_ids=batch, num_workers=args.workers,
-                          dataset_name="{}_{}".format(args.fiftyone_dataset_name, batch_hash),
-                          drop_existing_dataset=True)
-            if args.dataset_dir is not None:
-                kwargs["dataset_dir"] = str(args.dataset_dir)
-            try:
-                dataset = foz.load_zoo_dataset(args.zoo_dataset, **kwargs)
-                found = set()
-                for sample in dataset:
-                    filepath = Path(sample.filepath)
-                    image_id = str(sample.get_field("open_images_id") or filepath.stem).strip() if "open_images_id" in sample.field_names else filepath.stem
-                    if image_id in batch and filepath.is_file():
-                        found.add(image_id)
-                        apply_source(image_id, filepath, "fiftyone", str(filepath), store, paths, output_dir)
-                for image_id in set(batch) - found:
-                    store.add_error(image_id, "FiftyOne did not return this ImageID")
-            except Exception as error:
-                for image_id in batch:
-                    store.add_error(image_id, "FiftyOne: {}".format(error))
-            progress.update(min(args.fiftyone_batch_size, len(ids) - offset))
+    batch_hash = hashlib.sha1((args.split + "\n" + image_id).encode("utf-8")).hexdigest()[:12]
+    kwargs = dict(split=args.split, label_types=[], image_ids=[image_id], num_workers=1,
+                  dataset_name="{}_{}".format(args.fiftyone_dataset_name, batch_hash),
+                  drop_existing_dataset=True)
+    if args.dataset_dir is not None:
+        kwargs["dataset_dir"] = str(args.dataset_dir)
+    try:
+        dataset = foz.load_zoo_dataset(args.zoo_dataset, **kwargs)
+        found = False
+        for sample in dataset:
+            filepath = Path(sample.filepath)
+            sample_id = str(sample.get_field("open_images_id") or filepath.stem).strip() if "open_images_id" in sample.field_names else filepath.stem
+            if sample_id == image_id and filepath.is_file():
+                found = True
+                apply_source(image_id, filepath, "fiftyone", str(filepath), store, paths, output_dir)
+                if not store.pending_rows(image_id):
+                    break
+        if not found:
+            store.add_error(image_id, "FiftyOne did not return this ImageID")
+    except Exception as error:
+        store.add_error(image_id, "FiftyOne: {}".format(error))
 
 
 def tfds_id(example, key):
@@ -436,37 +447,97 @@ def tfds_id(example, key):
     return Path(str(value)).stem
 
 
-def tfds_stage(ids, store, paths, output_dir, args):
-    remaining = {image_id for image_id in ids if store.pending_rows(image_id)}
-    if not remaining:
-        return
-    try:
-        import tensorflow_datasets as tfds
-        dataset, info = tfds.load(args.tfds_name, split=args.split, data_dir=str(args.tfds_data_dir), download=args.download_tfds_data, try_gcs=False, shuffle_files=False, with_info=True)
-        total = int(info.splits[args.split].num_examples)
-        with tqdm(total=total, desc="Scanning TFDS", unit="example", mininterval=args.progress_refresh_seconds) as progress:
-            for example in tfds.as_numpy(dataset):
-                image_id = tfds_id(example, args.tfds_image_id_key)
-                if image_id in remaining:
-                    temporary = output_dir / ".fallback_cache" / (image_id + ".tfds.jpg")
-                    temporary.parent.mkdir(parents=True, exist_ok=True)
-                    try:
-                        Image.fromarray(example["image"]).convert("RGB").save(temporary, format="JPEG", quality=95)
-                        apply_source(image_id, temporary, "tfds", args.tfds_name + ":" + image_id, store, paths, output_dir)
-                    except (OSError, ValueError, KeyError) as error:
-                        store.add_error(image_id, "TFDS image: {}".format(error))
-                    finally:
-                        temporary.unlink(missing_ok=True)
-                    remaining.remove(image_id)
-                progress.update(1)
-                if not remaining:
-                    break
-        for image_id in remaining:
+class TFDSLookup:
+    """Index IDs once, then read just the matching TFDS example for each image."""
+
+    def __init__(self, store, args):
+        self.store = store
+        self.args = args
+        self.tfds = None
+        self.cache_key = None
+        self.error = None
+
+    def prepare(self):
+        if self.cache_key is not None or self.error is not None:
+            return
+        try:
+            import tensorflow_datasets as tfds
+            self.tfds = tfds
+            # Sequential shard order aligns positions with TFDS split slices.
+            read_config = tfds.ReadConfig(interleave_cycle_length=1)
+            dataset, info = tfds.load(
+                self.args.tfds_name, split=self.args.split,
+                data_dir=str(self.args.tfds_data_dir), download=self.args.download_tfds_data,
+                try_gcs=False, shuffle_files=False, with_info=True,
+                decoders={"image": tfds.decode.SkipDecoding()}, read_config=read_config,
+            )
+            total = int(info.splits[self.args.split].num_examples)
+            cache_key = json.dumps((
+                str(self.args.tfds_data_dir), info.full_name, self.args.split,
+                self.args.tfds_image_id_key, total,
+            ))
+            ready = self.store.db.execute(
+                "SELECT example_count FROM tfds_index_ready WHERE cache_key = ?", (cache_key,)
+            ).fetchone()
+            if ready != (total,):
+                self.store.db.execute("DELETE FROM tfds_index WHERE cache_key = ?", (cache_key,))
+                self.store.db.execute("DELETE FROM tfds_index_ready WHERE cache_key = ?", (cache_key,))
+                self.store.db.commit()
+                count = 0
+                batch = []
+                with tqdm(total=total, desc="Indexing TFDS IDs", unit="example",
+                          mininterval=self.args.progress_refresh_seconds) as progress:
+                    for count, example in enumerate(tfds.as_numpy(dataset), start=1):
+                        batch.append((cache_key, tfds_id(example, self.args.tfds_image_id_key), count - 1))
+                        if len(batch) >= 5000:
+                            self.store.db.executemany(
+                                "INSERT OR REPLACE INTO tfds_index VALUES (?, ?, ?)", batch
+                            )
+                            self.store.db.commit()
+                            batch.clear()
+                        progress.update(1)
+                if count != total:
+                    raise RuntimeError("TFDS has {} examples; metadata says {}".format(count, total))
+                if batch:
+                    self.store.db.executemany("INSERT OR REPLACE INTO tfds_index VALUES (?, ?, ?)", batch)
+                self.store.db.execute("INSERT INTO tfds_index_ready VALUES (?, ?)", (cache_key, total))
+                self.store.db.commit()
+            self.cache_key = cache_key
+        except Exception as error:
+            self.error = "{}: {}".format(type(error).__name__, error)
+
+    def load_one(self, image_id, store, paths, output_dir):
+        self.prepare()
+        if self.error is not None:
+            store.add_error(image_id, "TFDS unavailable or index failed: " + self.error)
+            return
+        row = store.db.execute(
+            "SELECT position FROM tfds_index WHERE cache_key = ? AND image_id = ?",
+            (self.cache_key, image_id),
+        ).fetchone()
+        if row is None:
             store.add_error(image_id, "ImageID absent from TFDS split")
-    except Exception as error:
-        print("TFDS unavailable or scan failed; continuing with ImageID URLs: {}".format(error), flush=True)
-        for image_id in remaining:
-            store.add_error(image_id, "TFDS unavailable or scan failed: {}".format(error))
+            return
+        position = row[0]
+        temporary = output_dir / ".fallback_cache" / (image_id + ".tfds")
+        try:
+            dataset = self.tfds.load(
+                self.args.tfds_name,
+                split="{}[{}:{}]".format(self.args.split, position, position + 1),
+                data_dir=str(self.args.tfds_data_dir), download=False, try_gcs=False,
+                shuffle_files=False, decoders={"image": self.tfds.decode.SkipDecoding()},
+            )
+            example = next(iter(self.tfds.as_numpy(dataset)))
+            if tfds_id(example, self.args.tfds_image_id_key) != image_id:
+                raise ValueError("TFDS index points to another ImageID")
+            temporary.parent.mkdir(parents=True, exist_ok=True)
+            temporary.write_bytes(example["image"])
+            apply_source(image_id, temporary, "tfds", self.args.tfds_name + ":" + image_id,
+                         store, paths, output_dir)
+        except Exception as error:
+            store.add_error(image_id, "TFDS image: {}".format(error))
+        finally:
+            temporary.unlink(missing_ok=True)
 
 
 def url_candidates(image_id, metadata_urls, args):
@@ -481,68 +552,68 @@ def url_candidates(image_id, metadata_urls, args):
             yield kind, url
 
 
-def fetch_url(image_id, metadata_urls, cache_dir, args):
+def fetch_url(image_id, kind, url, cache_dir, args):
     cache_dir.mkdir(parents=True, exist_ok=True)
     temporary = cache_dir / (image_id + ".download")
     errors = []
-    for kind, url in url_candidates(image_id, metadata_urls, args):
-        if urllib.parse.urlparse(url).scheme not in ("http", "https"):
-            errors.append("{}: unsupported URL scheme".format(kind))
-            continue
-        for attempt in range(args.url_retries):
+    if urllib.parse.urlparse(url).scheme not in ("http", "https"):
+        return None, "{}: unsupported URL scheme".format(kind)
+    for attempt in range(args.url_retries):
+        temporary.unlink(missing_ok=True)
+        try:
+            request = urllib.request.Request(url, headers={"User-Agent": "TinyCLIP-OpenImages-downloader/1.0"})
+            with urllib.request.urlopen(request, timeout=args.url_timeout) as response, temporary.open("wb") as target:
+                shutil.copyfileobj(response, target)
+            image_suffix(temporary)
+            return temporary, ""
+        except (OSError, ValueError, urllib.error.URLError) as error:
+            errors.append("{} attempt {}/{}: {}".format(kind, attempt + 1, args.url_retries, error))
             temporary.unlink(missing_ok=True)
-            try:
-                request = urllib.request.Request(url, headers={"User-Agent": "TinyCLIP-OpenImages-downloader/1.0"})
-                with urllib.request.urlopen(request, timeout=args.url_timeout) as response, temporary.open("wb") as target:
-                    shutil.copyfileobj(response, target)
-                image_suffix(temporary)
-                return image_id, temporary, kind, url, ""
-            except (OSError, ValueError, urllib.error.URLError) as error:
-                errors.append("{} attempt {}/{}: {}".format(kind, attempt + 1, args.url_retries, error))
-                temporary.unlink(missing_ok=True)
-                if isinstance(error, urllib.error.HTTPError) and error.code in (403, 404):
-                    break
-                if attempt + 1 < args.url_retries:
-                    time.sleep(args.url_backoff * 2 ** attempt)
-    return image_id, None, "", "", " | ".join(errors) or "No usable URL"
+            if isinstance(error, urllib.error.HTTPError) and error.code in (403, 404):
+                break
+            if attempt + 1 < args.url_retries:
+                time.sleep(args.url_backoff * 2 ** attempt)
+    return None, " | ".join(errors)
 
 
-def url_stage(ids, metadata_urls, store, paths, output_dir, args):
-    remaining = [image_id for image_id in ids if store.pending_rows(image_id)]
-    if not remaining:
-        return
+def process_image(image_id, metadata_urls, store, paths, output_dir, args, tfds_lookup):
+    attempted = store.failed_sources(image_id)
+    fiftyone_key = json.dumps(("fiftyone", args.zoo_dataset, args.split, str(args.dataset_dir)))
+    if fiftyone_key not in attempted:
+        fiftyone_one(image_id, store, paths, output_dir, args)
+        if not store.pending_rows(image_id):
+            return
+        store.mark_source_failed(image_id, fiftyone_key)
+
+    tfds_key = json.dumps(("tfds", args.tfds_name, args.split, str(args.tfds_data_dir),
+                           args.tfds_image_id_key))
+    if tfds_key not in attempted:
+        tfds_lookup.load_one(image_id, store, paths, output_dir)
+        if not store.pending_rows(image_id):
+            return
+        store.mark_source_failed(image_id, tfds_key)
+
     cache_dir = output_dir / ".fallback_cache"
-    with ThreadPoolExecutor(max_workers=args.workers) as pool, tqdm(total=len(remaining), desc="ImageID URLs", unit="ID", mininterval=args.progress_refresh_seconds) as progress:
-        iterator = iter(remaining)
-        futures = {}
-
-        def submit_next():
-            image_id = next(iterator, None)
-            if image_id is not None:
-                future = pool.submit(fetch_url, image_id, metadata_urls.get(image_id, []), cache_dir, args)
-                futures[future] = image_id
-
-        for _ in range(min(len(remaining), args.workers * 2)):
-            submit_next()
-        while futures:
-            done, _ = wait(futures, return_when=FIRST_COMPLETED)
-            for future in done:
-                image_id = futures.pop(future)
-                temporary = None
-                try:
-                    _, temporary, kind, url, error = future.result()
-                    if temporary is None:
-                        store.add_error(image_id, "URL: " + error)
-                    else:
-                        apply_source(image_id, temporary, kind, url, store, paths, output_dir)
-                except Exception as error:
-                    store.add_error(image_id, "URL worker: {}".format(error))
-                finally:
-                    if temporary is not None:
-                        temporary.unlink(missing_ok=True)
-                    store.finish_failed(image_id)
-                    progress.update(1)
-                    submit_next()
+    for kind, url in url_candidates(image_id, metadata_urls.get(image_id, []), args):
+        url_key = json.dumps(("url", url))
+        if url_key in attempted:
+            continue
+        temporary = None
+        try:
+            temporary, error = fetch_url(image_id, kind, url, cache_dir, args)
+            if temporary is None:
+                store.add_error(image_id, "URL: " + error)
+            else:
+                apply_source(image_id, temporary, kind, url, store, paths, output_dir)
+        except Exception as error:
+            store.add_error(image_id, "URL: {}".format(error))
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+        if not store.pending_rows(image_id):
+            return
+        store.mark_source_failed(image_id, url_key)
+    store.finish_failed(image_id)
 
 
 def process_manifest(args, expected_split=None):
@@ -563,6 +634,8 @@ def process_manifest(args, expected_split=None):
     store = DownloadStore(checkpoint)
     try:
         store.seed(manifest_rows, args.progress_refresh_seconds)
+        if args.retry_failed:
+            store.retry_failed()
         check_existing_images(store, manifest_rows, paths, output_dir, args.workers, args.progress_refresh_seconds)
         pending = list(dict.fromkeys(
             image_id for (image_id,) in store.db.execute(
@@ -578,9 +651,14 @@ def process_manifest(args, expected_split=None):
         for split, selected_ids in grouped.items():
             args.split = split
             print("Split {}: {} pending ImageIDs".format(split, len(selected_ids)), flush=True)
-            fiftyone_stage(selected_ids, store, paths, output_dir, args)
-            tfds_stage(selected_ids, store, paths, output_dir, args)
-            url_stage(selected_ids, metadata_urls, store, paths, output_dir, args)
+            tfds_lookup = TFDSLookup(store, args)
+            with tqdm(total=len(selected_ids), desc="Downloading {}".format(split),
+                      unit="ID", mininterval=args.progress_refresh_seconds) as progress:
+                for image_id in selected_ids:
+                    if store.pending_rows(image_id):
+                        process_image(image_id, metadata_urls, store, paths, output_dir,
+                                      args, tfds_lookup)
+                    progress.update(1)
         write_status(input_path, status_path, fields, store, args.progress_refresh_seconds)
         summary = store.summary()
         print("Status counts: {}".format(summary), flush=True)
