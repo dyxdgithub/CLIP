@@ -1,4 +1,4 @@
-"""Download each Open Image through FiftyOne, TFDS, then ImageID URLs.
+"""Download each Open Image through TFDS, then ImageID URLs.
 
 By default, the three OpenImages captioned manifests are processed separately.
 Hierarchy layout places each row in its parent/leaf folder. Flat layout saves
@@ -9,7 +9,6 @@ the next untried source; use --retry-failed to retry exhausted sources.
 
 import argparse
 import csv
-import hashlib
 import json
 import os
 import re
@@ -37,6 +36,7 @@ OPENIMAGES_STATUS = OPENIMAGES_DIR / "captioned_only_download_status.csv"
 DEFAULT_S3 = "https://open-images-dataset.s3.amazonaws.com/{split}/{image_id}.jpg"
 SUFFIXES = {"JPEG": ".jpg", "PNG": ".png", "WEBP": ".webp", "BMP": ".bmp"}
 STATUS_FIELDS = ("DownloadStatus", "DownloadSource", "DownloadedImagePath", "DownloadError")
+# Keep old FiftyOne successes valid when reading existing checkpoints.
 DONE = {"existing", "fiftyone", "tfds", "s3", "original_url", "thumbnail_url"}
 
 
@@ -48,12 +48,8 @@ def parse_args(argv=None):
     parser.add_argument("--output-dir", type=Path, help="Image directory. Flat mode uses OpenImages/train, test, and val for the built-in manifests; a custom flat --input requires this option. Hierarchy defaults to OpenImages/hierarchy.")
     parser.add_argument("--status-output", type=Path, help="Status CSV path. Built-in flat manifests add a split suffix; hierarchy defaults to OpenImages/hierarchy_download_status.csv.")
     parser.add_argument("--checkpoint-db", type=Path, help="SQLite checkpoint. Flat three-file mode adds a split suffix; default: hidden database beside each status CSV.")
-    parser.add_argument("--split", choices=("auto", "train", "validation", "test"), help="FiftyOne, TFDS, and S3 split. auto reads --subset-column and is required for flat three-file mode; default: train for hierarchy, auto for flat.")
+    parser.add_argument("--split", choices=("auto", "train", "validation", "test"), help="TFDS and S3 split. auto reads --subset-column and is required for flat three-file mode; default: train for hierarchy, auto for flat.")
     parser.add_argument("--subset-column", default="Subset", help="Split column when --split auto is used; accepts train, validation, test. Default: %(default)s")
-    parser.add_argument("--zoo-dataset", default="open-images-v7", help="FiftyOne Zoo dataset. Default: %(default)s")
-    parser.add_argument("--fiftyone-dataset-name", default="tinyclip_n2_fallback", help="Prefix for per-image FiftyOne dataset names. Default: %(default)s")
-    parser.add_argument("--dataset-dir", type=Path, help="FiftyOne cache directory. Default: FiftyOne's configured directory.")
-    parser.add_argument("--fiftyone-batch-size", type=int, default=1, help="Deprecated compatibility option; each FiftyOne call now requests exactly one ID.")
     parser.add_argument("--workers", type=int, default=128, help="Existing-image check workers; downloads proceed one image at a time. Default: %(default)s")
     parser.add_argument("--tfds-name", default="open_images_v4/200k", help="TFDS builder/configuration. Default: %(default)s")
     parser.add_argument("--tfds-data-dir", type=Path, help="TFDS prepared-data directory. Default: OpenImages/tfds_open_images_v4.")
@@ -101,7 +97,7 @@ def parse_args(argv=None):
         args.split = "auto" if args.layout == "flat" else "train"
     if args.layout == "flat" and args.input is None and args.split != "auto":
         parser.error("--split must be auto when processing all three OpenImages manifests")
-    for name in ("fiftyone_batch_size", "workers", "url_retries"):
+    for name in ("workers", "url_retries"):
         if getattr(args, name) <= 0:
             parser.error("--{} must be positive".format(name.replace("_", "-")))
     if args.max_image_ids is not None and args.max_image_ids <= 0:
@@ -405,35 +401,6 @@ def apply_source(image_id, source_path, source_kind, source_label, store, paths,
             store.add_error(image_id, "{} copy: {}".format(source_kind, error))
 
 
-def fiftyone_one(image_id, store, paths, output_dir, args):
-    try:
-        import fiftyone.zoo as foz
-    except Exception as error:
-        store.add_error(image_id, "FiftyOne unavailable: {}".format(error))
-        return
-    batch_hash = hashlib.sha1((args.split + "\n" + image_id).encode("utf-8")).hexdigest()[:12]
-    kwargs = dict(split=args.split, label_types=[], image_ids=[image_id], num_workers=1,
-                  dataset_name="{}_{}".format(args.fiftyone_dataset_name, batch_hash),
-                  drop_existing_dataset=True)
-    if args.dataset_dir is not None:
-        kwargs["dataset_dir"] = str(args.dataset_dir)
-    try:
-        dataset = foz.load_zoo_dataset(args.zoo_dataset, **kwargs)
-        found = False
-        for sample in dataset:
-            filepath = Path(sample.filepath)
-            sample_id = str(sample.get_field("open_images_id") or filepath.stem).strip() if "open_images_id" in sample.field_names else filepath.stem
-            if sample_id == image_id and filepath.is_file():
-                found = True
-                apply_source(image_id, filepath, "fiftyone", str(filepath), store, paths, output_dir)
-                if not store.pending_rows(image_id):
-                    break
-        if not found:
-            store.add_error(image_id, "FiftyOne did not return this ImageID")
-    except Exception as error:
-        store.add_error(image_id, "FiftyOne: {}".format(error))
-
-
 def tfds_id(example, key):
     if key == "auto":
         key = next((item for item in ("image_id", "image/filename", "image_filename", "id") if item in example), None)
@@ -578,13 +545,6 @@ def fetch_url(image_id, kind, url, cache_dir, args):
 
 def process_image(image_id, metadata_urls, store, paths, output_dir, args, tfds_lookup):
     attempted = store.failed_sources(image_id)
-    fiftyone_key = json.dumps(("fiftyone", args.zoo_dataset, args.split, str(args.dataset_dir)))
-    if fiftyone_key not in attempted:
-        fiftyone_one(image_id, store, paths, output_dir, args)
-        if not store.pending_rows(image_id):
-            return
-        store.mark_source_failed(image_id, fiftyone_key)
-
     tfds_key = json.dumps(("tfds", args.tfds_name, args.split, str(args.tfds_data_dir),
                            args.tfds_image_id_key))
     if tfds_key not in attempted:
@@ -625,8 +585,6 @@ def process_manifest(args, expected_split=None):
     if len({input_path, status_path, checkpoint}) != 3:
         raise ValueError("--input, --status-output, and --checkpoint-db must be different files")
     args.tfds_data_dir = args.tfds_data_dir.expanduser().resolve()
-    if args.dataset_dir is not None:
-        args.dataset_dir = args.dataset_dir.expanduser().resolve()
     fields, manifest_rows, metadata_urls, splits = read_manifest(input_path, args)
     if expected_split is not None and any(split != expected_split for split in splits.values()):
         raise ValueError("{} contains an ImageID outside the {} split".format(input_path, expected_split))
