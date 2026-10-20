@@ -12,3 +12,4 @@ thumbs.db
 my_code/data/Image_IDs_n2_all_downloaded_split_8_1_1.csv
 /my_code/data/Image IDs_with_last_two_layers_multi_members_n2_one_label_per_parent.csv
 /my_code/train/output/
+/my_code/test/output/
