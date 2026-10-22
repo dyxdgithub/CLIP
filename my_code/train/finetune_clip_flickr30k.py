@@ -14,7 +14,9 @@ import math
 import os
 import random
 import re
+import shutil
 import sys
+import time
 import warnings
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -315,6 +317,17 @@ def save_checkpoint(path, model, optimizer, scaler, epoch, global_step, best_sco
     temporary = path.with_name(path.name + ".tmp")
     torch.save(payload, temporary)
     os.replace(temporary, path)
+
+
+def promote_checkpoint(source, destination):
+    """Keep the current best without serializing the same epoch twice."""
+    temporary = destination.with_name(destination.name + ".tmp")
+    temporary.unlink(missing_ok=True)
+    try:
+        os.link(source, temporary)
+    except OSError:
+        shutil.copyfile(source, temporary)
+    os.replace(temporary, destination)
 
 
 def load_checkpoint(path, model, optimizer, scaler, identity):
@@ -671,19 +684,30 @@ def main(argv=None):
             global_step, train_metrics = train_epoch(
                 model, train_dataset, args, device, precision, optimizer, scaler, epoch,
                 global_step, total_steps, log_path, writer, bad_image_path, seen_bad_images)
+            print("Epoch {}/{}: training finished; validating {} images".format(
+                epoch + 1, args.epochs, len(by_split["validation"])), flush=True)
+            phase_start = time.perf_counter()
             val_metrics = evaluate(
                 model, by_split["validation"], caption_tokens, preprocess, args, device, precision,
                 "validation", bad_image_path, seen_bad_images, hf_splits["validation"])
+            print("Epoch {}/{}: validation finished in {:.1f}s; writing metrics".format(
+                epoch + 1, args.epochs, time.perf_counter() - phase_start), flush=True)
             metrics = {"epoch": epoch + 1, "step": global_step, **train_metrics, **val_metrics}
             append_log(log_path, metrics, writer)
             print(json.dumps(metrics, ensure_ascii=False, indent=2), flush=True)
             score = val_metrics["validation/mean_recall"]
-            if score > best_score:
+            is_best = score > best_score
+            if is_best:
                 best_score = score
-                save_checkpoint(args.output_dir / "best.pt", model, optimizer, scaler,
-                                          epoch, global_step, best_score, identity)
+            print("Epoch {}/{}: saving last.pt{}".format(
+                epoch + 1, args.epochs, " and best.pt" if is_best else ""), flush=True)
+            phase_start = time.perf_counter()
             save_checkpoint(args.output_dir / "last.pt", model, optimizer, scaler,
                                       epoch, global_step, best_score, identity)
+            if is_best:
+                promote_checkpoint(args.output_dir / "last.pt", args.output_dir / "best.pt")
+            print("Epoch {}/{}: checkpoint finished in {:.1f}s".format(
+                epoch + 1, args.epochs, time.perf_counter() - phase_start), flush=True)
     print("Outputs: {}".format(args.output_dir), flush=True)
 
 
