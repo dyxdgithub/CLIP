@@ -5,6 +5,8 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
 
+export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
+
 PYTHON_BIN="${PYTHON_BIN:-python}"
 MODEL_NAME="${MODEL_NAME:-ViT-B/32}"
 MODEL_SLUG="${MODEL_NAME//\//-}"
@@ -37,8 +39,8 @@ else
   fi
 fi
 
-printf 'Flickr30K training: model=%s device=%s batch=%s output=%s\n' \
-  "$MODEL_NAME" "$DEVICE" "$BATCH_SIZE" "$OUTPUT_LABEL"
+printf 'Flickr30K training: model=%s device=%s batch=%s output=%s HF_ENDPOINT=%s\n' \
+  "$MODEL_NAME" "$DEVICE" "$BATCH_SIZE" "$OUTPUT_LABEL" "$HF_ENDPOINT"
 
 "$PYTHON_BIN" my_code/train/finetune_clip_flickr30k.py \
   --model "$MODEL_NAME" \
