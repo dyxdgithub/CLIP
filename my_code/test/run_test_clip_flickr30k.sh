@@ -5,6 +5,8 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
 
+export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
+
 CHECKPOINT="${1:?Usage: bash my_code/test/run_test_clip_flickr30k.sh /path/to/best.pt [options]}"
 shift
 PYTHON_BIN="${PYTHON_BIN:-python}"
