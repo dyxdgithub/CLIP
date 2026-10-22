@@ -19,6 +19,7 @@ SCORE_BATCH_SIZE="${SCORE_BATCH_SIZE:-128}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 LEARNING_RATE="${LEARNING_RATE:-1e-5}"
 SEED="${SEED:-42}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-$HOME/clip_flickr30k_runs}"
 OUTPUT_ARGS=()
 OUTPUT_LABEL="checkpoint directory"
 if [[ -n "${OUTPUT_PATH:-}" ]]; then
@@ -33,7 +34,7 @@ else
     fi
   done
   if [[ "$RESUMING" == "0" ]]; then
-    OUTPUT_PATH="$SCRIPT_DIR/output/clip_flickr30k_${MODEL_SLUG}_$(date +%Y%m%d_%H%M%S)_$$"
+    OUTPUT_PATH="$OUTPUT_ROOT/clip_flickr30k_${MODEL_SLUG}_$(date +%Y%m%d_%H%M%S)_$$"
     OUTPUT_ARGS=(--output-dir "$OUTPUT_PATH")
     OUTPUT_LABEL="$OUTPUT_PATH"
   fi
