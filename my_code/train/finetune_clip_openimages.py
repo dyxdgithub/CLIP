@@ -60,7 +60,7 @@ class Sample:
     image_id: str
     split: str
     caption_indices: list
-    image_path: Path
+    image_path: Path = None
     original_url: str = ""
     thumbnail_url: str = ""
     original_md5: str = ""
@@ -174,7 +174,7 @@ def load_sample_image(sample, image_source, online_cache_dir, timeout, retries,
     cache_path = (online_cache_dir / SPLIT_FOLDERS[sample.split] /
                   (sample.image_id + ".img")) if online_cache_dir else None
     for path in (sample.image_path, cache_path):
-        if path is None or not path.is_file():
+        if path is None or (path == cache_path and not path.is_file()):
             continue
         try:
             return load_rgb_image(path, allow_truncated)
@@ -563,13 +563,16 @@ def evaluate(model, samples, caption_tokens, preprocess, args, device, precision
     return metrics
 
 
-def discover_images(folder):
+def discover_images(folder, allow_missing=False):
     """Index one flat download directory once rather than stat every CSV row."""
     if not folder.is_dir():
+        if allow_missing:
+            return {}
         raise FileNotFoundError("Image directory does not exist: {}".format(folder))
     found = {}
     with os.scandir(folder) as entries:
-        for entry in entries:
+        for entry in tqdm(entries, desc="Index {} images".format(folder.name),
+                          unit="file", leave=False, mininterval=2):
             suffix = Path(entry.name).suffix.lower()
             image_id = Path(entry.name).stem.lower()
             if suffix not in IMAGE_SUFFIXES or not re.fullmatch(r"[0-9a-f]{16}", image_id):
@@ -580,6 +583,16 @@ def discover_images(folder):
             if previous is None or IMAGE_SUFFIXES.index(suffix) < IMAGE_SUFFIXES.index(previous.suffix.lower()):
                 found[image_id] = Path(entry.path)
     return found
+
+
+def refresh_online_local_paths(samples, image_root, split):
+    """Pick up files completed by the separate downloader between epochs."""
+    images = discover_images(image_root / SPLIT_FOLDERS[split], allow_missing=True)
+    for sample in samples:
+        sample.image_path = images.get(sample.image_id)
+    available = sum(sample.image_path is not None for sample in samples)
+    print("{}: {} / {} images available locally at epoch boundary".format(
+        split, available, len(samples)), flush=True)
 
 
 def read_openimages(csv_dir, image_root, skip_missing_images=False, image_source="local"):
@@ -595,7 +608,7 @@ def read_openimages(csv_dir, image_root, skip_missing_images=False, image_source
         csv_path = csv_dir / CSV_NAME.format(split)
         if not csv_path.is_file():
             raise FileNotFoundError("Missing {} CSV: {}".format(split, csv_path))
-        images = discover_images(image_root / folder) if image_source == "local" else {}
+        images = discover_images(image_root / folder, allow_missing=image_source == "online")
         if image_source == "local" and not images:
             raise FileNotFoundError("No downloaded images found in {}".format(image_root / folder))
         samples_by_id = {}
@@ -622,8 +635,6 @@ def read_openimages(csv_dir, image_root, skip_missing_images=False, image_source
                 if image_source == "local" and image_path is None:
                     missing_ids.add(image_id)
                     continue
-                if image_path is None:
-                    image_path = image_root / folder / (image_id + ".jpg")
                 sample = samples_by_id.get(image_id)
                 if sample is None:
                     sample = Sample(image_id, split, [], image_path,
@@ -654,8 +665,9 @@ def read_openimages(csv_dir, image_root, skip_missing_images=False, image_source
         csv_hashes[split] = sha256_file(csv_path)
         missing_counts[split] = len(missing_ids) if image_source == "local" else None
         if image_source == "online":
-            print("{}: {} CSV rows, {} unique ImageIDs; missing pixels fetched on demand".format(
-                split, rows, len(split_ids)), flush=True)
+            locally_available = sum(sample.image_path is not None for sample in by_split[split])
+            print("{}: {} CSV rows, {} unique ImageIDs, {} local; rest fetched on demand".format(
+                split, rows, len(split_ids), locally_available), flush=True)
         else:
             print("{}: {} CSV rows, {} unique ImageIDs, {} available, {} missing".format(
                 split, rows, len(split_ids), len(samples_by_id), len(missing_ids)), flush=True)
@@ -815,16 +827,24 @@ def main(argv=None):
         payload = load_checkpoint(args.resume, model, optimizer, scaler, identity)
         start_epoch, global_step, best_score = payload["epoch"] + 1, payload["global_step"], payload["best_score"]
         print("Resumed epoch {} at step {}".format(start_epoch, global_step), flush=True)
+    if args.image_source == "online" and args.batch_size >= 128:
+        warnings.warn("Online images are fetched serially within each DataLoader batch; "
+                      "a batch of {} can delay every progress update and may exceed GPU memory. "
+                      "Try --batch-size 16 or 32.".format(args.batch_size), RuntimeWarning)
     steps_per_epoch = len(train_dataset) // args.batch_size if len(train_dataset) % args.batch_size == 1 else math.ceil(len(train_dataset) / args.batch_size)
     total_steps = args.epochs * steps_per_epoch
     with SummaryWriter(log_dir=str(args.output_dir / "tensorboard"),
                        purge_step=global_step + 1 if args.resume else None) as writer:
         for epoch in range(start_epoch, args.epochs):
+            if args.image_source == "online" and epoch > start_epoch:
+                refresh_online_local_paths(by_split["train"], args.image_root, "train")
             global_step, train_metrics = train_epoch(
                 model, train_dataset, args, device, precision, optimizer, scaler, epoch,
                 global_step, total_steps, log_path, writer, bad_image_path, seen_bad_images)
             print("Epoch {}/{}: training finished; validating {} images".format(
                 epoch + 1, args.epochs, len(by_split["validation"])), flush=True)
+            if args.image_source == "online":
+                refresh_online_local_paths(by_split["validation"], args.image_root, "validation")
             phase_start = time.perf_counter()
             val_metrics = evaluate(
                 model, by_split["validation"], caption_tokens, preprocess, args, device, precision,
