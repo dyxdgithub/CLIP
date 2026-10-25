@@ -26,12 +26,30 @@ python my_code/data/scripts/download__images.py --workers 32 --timeout 45 --retr
 ```
 
 首次启动会读取三份 CSV 并建立去重索引；之后 CSV 文件未变时直接使用 SQLite
-检查点。中断后运行同一命令即可续跑。检查点为
-`OpenImages/.openimages_v7_download.sqlite3`；每个 split 的状态在
-`captioned_only_download_status_<split>.csv`，总数在
-`download_summary.json`。状态文件按唯一 ImageID 记录，不重复列出同一图片的
-多条 caption。每次运行会重试仍失败的图片；用 `--retry-permanent`
-也可重试此前返回 404/410 的 URL。用 `--verify-existing` 可重新解码全部已有图片。
+检查点。普通续跑直接跳过数据库中 `ok` 的图片，只检查未完成图片并重试失败项，
+不会再对每张已完成图片执行文件查找。检查点默认为
+`OpenImages/.openimages_v7_download.sqlite3`，最新计数在
+`OpenImages/download_summary.json`。如果在脚本运行之外删除或修改过图片，先用
+`--check-existing` 重新检查所有已完成图片的文件大小；用 `--verify-existing`
+重新解码所有图片。`--retry-permanent` 会重试此前返回 404/410 的 URL。
+
+逐图片状态 CSV 默认不再每次重写；需要导出时加 `--write-status-csv`，输出
+`captioned_only_download_status_<split>.csv`。已有的状态 CSV 不会自动刷新，
+应以 SQLite 检查点和 `download_summary.json` 为准。CSV 按唯一 ImageID 记录，
+不重复列出同一图片的多条 caption。
+
+如果图片目录在慢速外接盘上，可将 SQLite 检查点及报告放在更快的本地盘，
+例如服务器上的 ext4：
+
+```bash
+python my_code/data/scripts/download__images.py \
+  --state-dir /home/xyycyc/openimages-download-state
+```
+
+第一次指定新的 `--state-dir` 时，脚本会用 SQLite 备份 API 复制旧检查点
+（包括尚未合并的 WAL 数据），不重新下载已有图片。迁移期间不要同时运行旧版
+下载进程。原检查点保留在图片目录中，后续运行保持使用同一个 `--state-dir`。
+`--state-dir` 只改变检查点和报告位置，图片仍写入 `--output-dir`。
 
 可先小规模检查：
 

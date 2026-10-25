@@ -17,6 +17,7 @@ import time
 import urllib.error
 import urllib.request
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from contextlib import closing
 from pathlib import Path
 
 from PIL import Image
@@ -36,7 +37,10 @@ def parse_args(argv=None):
     parser.add_argument("--csv-dir", type=Path, default=OPENIMAGES_DIR,
                         help="Directory with the three captioned_only CSVs. Default: my_code/data/OpenImages.")
     parser.add_argument("--output-dir", type=Path, default=OPENIMAGES_DIR,
-                        help="Output root containing train/, test/, val/ and checkpoint. Default: my_code/data/OpenImages.")
+                        help="Output root containing train/, test/ and val/. Default: my_code/data/OpenImages.")
+    parser.add_argument("--state-dir", type=Path,
+                        help="Directory for the SQLite checkpoint and reports. Defaults to --output-dir; "
+                             "use a fast local disk when images are on a slow external drive.")
     parser.add_argument("--split", choices=("all", *FOLDERS), default="all",
                         help="Process all three CSVs or one official Open Images split. Default: %(default)s.")
     parser.add_argument("--workers", type=int, default=64,
@@ -48,9 +52,16 @@ def parse_args(argv=None):
     parser.add_argument("--backoff", type=float, default=1.0,
                         help="Base exponential retry delay in seconds. Default: %(default)s.")
     parser.add_argument("--max-image-ids", type=int,
-                        help="Process at most this many unique IDs per CSV, useful for a small trial.")
+                        help="Consider only the first N unique IDs per CSV, useful for a small trial.")
+    parser.add_argument("--check-existing", action="store_true",
+                        help="Recheck the presence and saved size of every completed image. "
+                             "Normal resumes trust completed SQLite entries.")
     parser.add_argument("--verify-existing", action="store_true",
-                        help="Decode every existing image again, even when its saved file size matches.")
+                        help="Decode every existing image again, even when its saved file size matches; "
+                             "also implies --check-existing.")
+    parser.add_argument("--write-status-csv", action="store_true",
+                        help="Export the full per-image status CSV after each split. "
+                             "Omit for faster resumes; download_summary.json is always updated.")
     parser.add_argument("--retry-permanent", action="store_true",
                         help="Retry source URLs previously returning HTTP 404 or 410.")
     args = parser.parse_args(argv)
@@ -60,12 +71,33 @@ def parse_args(argv=None):
         parser.error("--max-image-ids must be positive")
     args.csv_dir = args.csv_dir.expanduser().resolve()
     args.output_dir = args.output_dir.expanduser().resolve()
+    args.state_dir = (args.state_dir.expanduser().resolve() if args.state_dir
+                      else args.output_dir)
     return args
 
 
-def open_database(root):
-    root.mkdir(parents=True, exist_ok=True)
-    db = sqlite3.connect(root / ".openimages_v7_download.sqlite3")
+def open_database(state_dir, output_dir):
+    state_dir.mkdir(parents=True, exist_ok=True)
+    db_path = state_dir / ".openimages_v7_download.sqlite3"
+    old_path = output_dir / db_path.name
+    if state_dir != output_dir and not db_path.exists() and old_path.is_file():
+        temporary = db_path.with_name(db_path.name + ".migrating")
+        temporary.unlink(missing_ok=True)
+        print("Copying existing download checkpoint to {} (do not run another downloader simultaneously)".format(
+            db_path), flush=True)
+        try:
+            with closing(sqlite3.connect(old_path, timeout=30)) as old_db:
+                with closing(sqlite3.connect(temporary)) as new_db:
+                    with tqdm(desc="Migrating checkpoint", unit="page") as progress:
+                        def update_progress(_status, remaining, total):
+                            progress.total = total
+                            progress.update(total - remaining - progress.n)
+
+                        old_db.backup(new_db, pages=1024, progress=update_progress)
+            os.replace(temporary, db_path)
+        finally:
+            temporary.unlink(missing_ok=True)
+    db = sqlite3.connect(db_path)
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA synchronous=NORMAL")
     db.execute(
@@ -271,12 +303,28 @@ def download_one(row, root, args):
 
 
 def process_split(db, split, root, args, count):
-    cursor = db.execute(
-        "SELECT split, image_id, original_url, thumbnail_url, original_md5, "
-        "status, path, file_size, permanent_urls FROM images WHERE split = ? ORDER BY image_id",
-        (split,),
-    )
-    total = min(count, args.max_image_ids) if args.max_image_ids else count
+    scope_count = min(count, args.max_image_ids) if args.max_image_ids else count
+    upper_id = None
+    if scope_count < count:
+        upper_id = db.execute(
+            "SELECT image_id FROM images WHERE split=? ORDER BY image_id LIMIT 1 OFFSET ?",
+            (split, scope_count - 1),
+        ).fetchone()[0]
+    check_all = args.check_existing or args.verify_existing
+    conditions = "split=? AND image_id>?"
+    if upper_id is not None:
+        conditions += " AND image_id<=?"
+    if not check_all:
+        conditions += " AND status!='ok'"
+    query_args = (split, "") + ((upper_id,) if upper_id is not None else ())
+    total = scope_count if check_all else db.execute(
+        "SELECT COUNT(*) FROM images WHERE " + conditions, query_args,
+    ).fetchone()[0]
+    print("{}: {} completed entries skipped; {} images to {}".format(
+        split, scope_count - total, total,
+        "recheck" if check_all else "download or recover"), flush=True)
+    if total == 0:
+        return
     submitted = 0
     completed = 0
     failures = 0
@@ -284,65 +332,86 @@ def process_split(db, split, root, args, count):
         total=total, desc="Downloading " + split, unit="image"
     ) as progress:
         futures = {}
+        pending_updates = []
+        last_commit = time.monotonic()
+
+        def flush_updates():
+            nonlocal last_commit
+            if not pending_updates:
+                return
+            db.executemany(
+                "UPDATE images SET status=?, source=COALESCE(?, source), path=?, error=?, "
+                "file_size=?, permanent_urls=? WHERE split=? AND image_id=?",
+                pending_updates,
+            )
+            db.commit()
+            pending_updates.clear()
+            last_commit = time.monotonic()
 
         def complete_one():
             nonlocal completed, failures
             done, _ = wait(futures, return_when=FIRST_COMPLETED)
-            updates = []
             for future in done:
                 image_id = futures.pop(future)
                 result = future.result()
                 if result[0] != image_id:
                     raise RuntimeError("Download worker returned a different ImageID")
                 _, status, source, path, error, size, blocked = result
-                updates.append((status, source, path, error, size, blocked, split, image_id))
+                pending_updates.append((status, source, path, error, size, blocked, split, image_id))
                 completed += 1
                 failures += status == "failed"
                 progress.update(1)
-            db.executemany(
-                "UPDATE images SET status=?, source=COALESCE(?, source), path=?, error=?, "
-                "file_size=?, permanent_urls=? WHERE split=? AND image_id=?",
-                updates,
-            )
-            db.commit()
+            if len(pending_updates) >= 128 or time.monotonic() - last_commit >= 5:
+                flush_updates()
 
+        last_id = ""
         while submitted < total:
-            row = cursor.fetchone()
-            if row is None:
+            page_args = (split, last_id) + ((upper_id,) if upper_id is not None else ())
+            rows = db.execute(
+                "SELECT split, image_id, original_url, thumbnail_url, original_md5, "
+                "status, path, file_size, permanent_urls FROM images WHERE " + conditions +
+                " ORDER BY image_id LIMIT 2048", page_args,
+            ).fetchall()
+            if not rows:
                 break
-            future = executor.submit(download_one, row, root, args)
-            futures[future] = row[1]
-            submitted += 1
-            if len(futures) >= args.workers * 4:
-                complete_one()
+            last_id = rows[-1][1]
+            for row in rows:
+                future = executor.submit(download_one, row, root, args)
+                futures[future] = row[1]
+                submitted += 1
+                if len(futures) >= args.workers * 4:
+                    complete_one()
         while futures:
             complete_one()
+        flush_updates()
     print("{}: checked {}, failed {}".format(split, completed, failures), flush=True)
 
 
-def write_report(db, split, root):
+def write_report(db, split, root, write_status_csv):
     status_path = root / ("captioned_only_download_status_{}.csv".format(split))
-    temporary = status_path.with_name(status_path.name + ".part")
-    with temporary.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.writer(handle)
-        writer.writerow(("ImageID", "Subset", "DownloadStatus", "DownloadSource", "DownloadedImagePath", "DownloadError"))
-        for image_id, status, source, path, error in db.execute(
-            "SELECT image_id, status, source, path, error FROM images WHERE split=? ORDER BY image_id",
-            (split,),
-        ):
-            writer.writerow((image_id, split, status, source, path, error))
-    os.replace(temporary, status_path)
+    if write_status_csv:
+        temporary = status_path.with_name(status_path.name + ".part")
+        with temporary.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(("ImageID", "Subset", "DownloadStatus", "DownloadSource", "DownloadedImagePath", "DownloadError"))
+            for image_id, status, source, path, error in db.execute(
+                "SELECT image_id, status, source, path, error FROM images WHERE split=? ORDER BY image_id",
+                (split,),
+            ):
+                writer.writerow((image_id, split, status, source, path, error))
+        os.replace(temporary, status_path)
     summary = dict(db.execute(
         "SELECT status, COUNT(*) FROM images WHERE split=? GROUP BY status", (split,)
     ))
-    print("{}: {} | {}".format(split, summary, status_path), flush=True)
+    report_note = str(status_path) if write_status_csv else "per-image CSV skipped (--write-status-csv to export)"
+    print("{}: {} | {}".format(split, summary, report_note), flush=True)
     return summary
 
 
 def main(argv=None):
     args = parse_args(argv)
     splits = tuple(FOLDERS) if args.split == "all" else (args.split,)
-    db = open_database(args.output_dir)
+    db = open_database(args.state_dir, args.output_dir)
     try:
         result = 0
         summaries = {}
@@ -350,9 +419,9 @@ def main(argv=None):
             path = args.csv_dir / CSV_NAME.format(split)
             count = import_manifest(db, split, path)
             process_split(db, split, args.output_dir, args, count)
-            summary = write_report(db, split, args.output_dir)
+            summary = write_report(db, split, args.state_dir, args.write_status_csv)
             summaries[split] = summary
-            summary_path = args.output_dir / "download_summary.json"
+            summary_path = args.state_dir / "download_summary.json"
             temporary = summary_path.with_name(summary_path.name + ".part")
             temporary.write_text(json.dumps(summaries, indent=2), encoding="utf-8")
             os.replace(temporary, summary_path)
