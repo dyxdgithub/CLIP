@@ -10,6 +10,7 @@ import base64
 import binascii
 import contextlib
 import csv
+import gzip
 import hashlib
 import io
 import json
@@ -46,6 +47,7 @@ CSV_NAME = "Image IDs_with_captions_and_labels_captioned_only_{}.csv"
 SPLIT_FOLDERS = {"train": "train", "validation": "val", "test": "test"}
 IMAGE_SUFFIXES = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
 S3_URL = "https://open-images-dataset.s3.amazonaws.com/{}/{}.jpg"
+DOWNLOADED_MANIFEST = "downloaded_image_ids.json.gz"
 
 
 CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
@@ -169,7 +171,7 @@ def fetch_online_image(sample, cache_path, timeout, retries, max_bytes, allow_tr
 
 def load_sample_image(sample, image_source, online_cache_dir, timeout, retries,
                       max_bytes, allow_truncated):
-    if image_source == "local":
+    if image_source != "online":
         return load_rgb_image(sample.image_path, allow_truncated)
     cache_path = (online_cache_dir / SPLIT_FOLDERS[sample.split] /
                   (sample.image_id + ".img")) if online_cache_dir else None
@@ -595,10 +597,13 @@ def refresh_online_local_paths(samples, image_root, split):
         split, available, len(samples)), flush=True)
 
 
-def read_openimages(csv_dir, image_root, skip_missing_images=False, image_source="local"):
+def read_openimages(csv_dir, image_root, skip_missing_images=False, image_source="local",
+                    selected_ids=None):
     """Read official split CSVs and group rows sharing an ImageID."""
-    if image_source not in ("local", "online"):
-        raise ValueError("image_source must be local or online")
+    if image_source not in ("local", "downloaded", "online"):
+        raise ValueError("image_source must be local, downloaded, or online")
+    if selected_ids is not None and image_source != "downloaded":
+        raise ValueError("Frozen image selection requires downloaded mode")
     by_split = {}
     captions, caption_to_index = [], {}
     seen_image_ids = set()
@@ -608,11 +613,13 @@ def read_openimages(csv_dir, image_root, skip_missing_images=False, image_source
         csv_path = csv_dir / CSV_NAME.format(split)
         if not csv_path.is_file():
             raise FileNotFoundError("Missing {} CSV: {}".format(split, csv_path))
-        images = discover_images(image_root / folder, allow_missing=image_source == "online")
+        images = ({} if image_source == "downloaded" and split == "test" else
+                  discover_images(image_root / folder, allow_missing=image_source != "local"))
         if image_source == "local" and not images:
             raise FileNotFoundError("No downloaded images found in {}".format(image_root / folder))
+        required_ids = set(selected_ids[split]) if selected_ids is not None else None
         samples_by_id = {}
-        split_ids, missing_ids = set(), set()
+        split_ids, missing_ids, missing_selected = set(), set(), set()
         rows = 0
         with csv_path.open("r", encoding="utf-8-sig", newline="") as handle:
             reader = csv.DictReader(handle)
@@ -631,9 +638,15 @@ def read_openimages(csv_dir, image_root, skip_missing_images=False, image_source
                 if not caption:
                     raise ValueError("Empty caption at {} row {}".format(csv_path, row_number))
                 split_ids.add(image_id)
+                if image_source == "downloaded" and (
+                        split == "test" or (required_ids is not None and image_id not in required_ids)):
+                    continue
                 image_path = images.get(image_id)
-                if image_source == "local" and image_path is None:
-                    missing_ids.add(image_id)
+                if image_source != "online" and image_path is None:
+                    if image_source == "downloaded" and required_ids is not None:
+                        missing_selected.add(image_id)
+                    elif image_source == "local":
+                        missing_ids.add(image_id)
                     continue
                 sample = samples_by_id.get(image_id)
                 if sample is None:
@@ -653,25 +666,76 @@ def read_openimages(csv_dir, image_root, skip_missing_images=False, image_source
                     captions.append(caption)
                 if caption_index not in sample.caption_indices:
                     sample.caption_indices.append(caption_index)
-        if missing_ids and not skip_missing_images:
+        if missing_selected:
+            raise FileNotFoundError("{} frozen {} images disappeared (e.g. {}). "
+                                    "Restore them before resuming.".format(
+                                        len(missing_selected), split,
+                                        ", ".join(sorted(missing_selected)[:5])))
+        if required_ids is not None and set(samples_by_id) != required_ids:
+            raise ValueError("Frozen {} ImageIDs no longer match the CSV".format(split))
+        if image_source == "local" and missing_ids and not skip_missing_images:
             examples = ", ".join(sorted(missing_ids)[:5])
             raise FileNotFoundError("{} downloaded images missing from {} CSV (e.g. {}). "
                                     "Finish downloading or use --skip-missing-images to change coverage.".format(
                                         len(missing_ids), split, examples))
-        if not samples_by_id:
+        if not samples_by_id and not (image_source == "downloaded" and split == "test"):
             raise ValueError("No usable images in {} split".format(split))
         seen_image_ids.update(split_ids)
         by_split[split] = list(samples_by_id.values())
         csv_hashes[split] = sha256_file(csv_path)
-        missing_counts[split] = len(missing_ids) if image_source == "local" else None
+        missing_counts[split] = (len(split_ids) - len(samples_by_id)
+                                 if image_source == "downloaded" else
+                                 len(missing_ids) if image_source == "local" else None)
         if image_source == "online":
             locally_available = sum(sample.image_path is not None for sample in by_split[split])
             print("{}: {} CSV rows, {} unique ImageIDs, {} local; rest fetched on demand".format(
                 split, rows, len(split_ids), locally_available), flush=True)
+        elif image_source == "downloaded":
+            print("{}: {} / {} CSV images selected; {} excluded{}".format(
+                split, len(samples_by_id), len(split_ids), missing_counts[split],
+                " (test held out)" if split == "test" else ""), flush=True)
         else:
             print("{}: {} CSV rows, {} unique ImageIDs, {} available, {} missing".format(
                 split, rows, len(split_ids), len(samples_by_id), len(missing_ids)), flush=True)
     return by_split, captions, csv_hashes, missing_counts
+
+
+def save_downloaded_manifest(path, by_split, csv_hashes):
+    """Freeze the subset so later downloads cannot change a resumed run."""
+    manifest = {
+        "version": 1,
+        "csv_sha256": csv_hashes,
+        "image_ids": {split: [sample.image_id for sample in by_split[split]]
+                      for split in SPLIT_FOLDERS},
+    }
+    temporary = path.with_name(path.name + ".tmp")
+    try:
+        with gzip.open(temporary, "wt", encoding="utf-8") as handle:
+            json.dump(manifest, handle, ensure_ascii=False, separators=(",", ":"))
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def load_downloaded_manifest(path):
+    if not path.is_file():
+        raise FileNotFoundError("Downloaded subset manifest required for resume: {}".format(path))
+    with gzip.open(path, "rt", encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    image_ids = manifest.get("image_ids")
+    if (manifest.get("version") != 1 or not isinstance(image_ids, dict)
+            or set(image_ids) != set(SPLIT_FOLDERS)):
+        raise ValueError("Invalid downloaded subset manifest: {}".format(path))
+    if image_ids["test"]:
+        raise ValueError("Downloaded subset manifest must hold out the test split")
+    for split, ids in image_ids.items():
+        if not isinstance(ids, list) or len(ids) != len(set(ids)) or any(
+                not isinstance(image_id, str) or not re.fullmatch(r"[0-9a-f]{16}", image_id)
+                for image_id in ids):
+            raise ValueError("Invalid {} ImageIDs in {}".format(split, path))
+    if not isinstance(manifest.get("csv_sha256"), dict):
+        raise ValueError("Missing CSV hashes in {}".format(path))
+    return manifest
 
 
 def split_digests(by_split, captions):
@@ -694,8 +758,8 @@ def parse_args(argv=None):
                         help="Directory holding the three captioned_only CSVs. Default: %(default)s.")
     parser.add_argument("--image-root", type=Path, default=OPENIMAGES_ROOT,
                         help="Directory containing train/, val/, test/ image folders. Default: %(default)s.")
-    parser.add_argument("--image-source", choices=("local", "online"), default="local",
-                        help="local requires downloaded files; online uses local files first and fetches missing pixels. Default: %(default)s.")
+    parser.add_argument("--image-source", choices=("local", "downloaded", "online"), default="local",
+                        help="local requires all CSV images; downloaded freezes available train/validation images; online fetches missing pixels. Default: %(default)s.")
     parser.add_argument("--online-cache-dir", type=Path,
                         help="Optional persistent cache for fetched images; default: no extra cache. Choose a disk with enough free space.")
     parser.add_argument("--online-timeout", type=float, default=15.0,
@@ -744,9 +808,9 @@ def parse_args(argv=None):
         parser.error("Batch size must be at least 2; workers/warmup/decay/clip nonnegative; lr positive")
     if args.online_timeout <= 0 or args.online_retries < 1 or args.online_max_image_mb < 1:
         parser.error("Online timeout, retries and maximum image size must be positive")
-    if args.image_source == "local" and args.online_cache_dir is not None:
+    if args.image_source != "online" and args.online_cache_dir is not None:
         parser.error("--online-cache-dir requires --image-source online")
-    if args.image_source == "online" and args.skip_missing_images:
+    if args.image_source != "local" and args.skip_missing_images:
         parser.error("--skip-missing-images is only valid with --image-source local")
     return args
 
@@ -771,8 +835,14 @@ def main(argv=None):
         raise FileNotFoundError("Resume checkpoint not found: {}".format(args.resume))
     if not args.resume and args.output_dir.exists() and any(args.output_dir.iterdir()):
         raise FileExistsError("Choose an empty --output-dir or specify --resume: {}".format(args.output_dir))
+    manifest_path = args.output_dir / DOWNLOADED_MANIFEST
+    frozen_manifest = (load_downloaded_manifest(manifest_path)
+                       if args.image_source == "downloaded" and args.resume else None)
     by_split, captions, csv_hashes, missing_counts = read_openimages(
-        args.csv_dir, args.image_root, args.skip_missing_images, args.image_source)
+        args.csv_dir, args.image_root, args.skip_missing_images, args.image_source,
+        frozen_manifest["image_ids"] if frozen_manifest else None)
+    if frozen_manifest and frozen_manifest["csv_sha256"] != csv_hashes:
+        raise ValueError("Open Images CSVs changed since this downloaded subset was frozen")
     print("Open Images: {}; unique captions: {}".format(
         {name: len(samples) for name, samples in by_split.items()}, len(captions)), flush=True)
     device = choose_device(args.device)
@@ -802,6 +872,13 @@ def main(argv=None):
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda" and precision == "fp16"))
     SummaryWriter = get_summary_writer()
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    if args.image_source == "downloaded" and not args.resume:
+        print("Saving frozen downloaded subset ({} train, {} validation images): {}".format(
+            len(by_split["train"]), len(by_split["validation"]), manifest_path), flush=True)
+        phase_start = time.perf_counter()
+        save_downloaded_manifest(manifest_path, by_split, csv_hashes)
+        print("Subset manifest saved in {:.1f}s".format(
+            time.perf_counter() - phase_start), flush=True)
     config_path = args.output_dir / "config.json"
     if args.resume and not config_path.is_file():
         raise FileNotFoundError("Resume requires config.json beside the checkpoint: {}".format(config_path))
@@ -810,8 +887,14 @@ def main(argv=None):
         config.update(identity)
         config.update({"resolved_device": str(device), "resolved_precision": precision,
                        "split_sizes": {name: len(samples) for name, samples in by_split.items()},
-                       "missing_images": missing_counts,
-                       "image_source_policy": "local file, optional cache, CVDF S3, OriginalURL, Thumbnail300KURL",
+                       "missing_images": missing_counts if args.image_source == "local" else None,
+                       "excluded_csv_images": missing_counts if args.image_source == "downloaded" else None,
+                       "subset_manifest": str(manifest_path) if args.image_source == "downloaded" else None,
+                       "image_source_policy": {
+                           "local": "all CSV images from local files",
+                           "downloaded": "frozen downloaded train/validation subset; test held out",
+                           "online": "local file, optional cache, CVDF S3, OriginalURL, Thumbnail300KURL",
+                       }[args.image_source],
                        "caption_sampling": "one of each image's CSV captions, rotating by epoch",
                        "selection_metric": "validation/mean_recall",
                        "caption_tokenization": "CLIP 77 tokens, truncate=True"})

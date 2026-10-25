@@ -8,7 +8,7 @@ cd "$REPO_ROOT"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 CSV_DIR="${CSV_DIR:-$REPO_ROOT/my_code/data/OpenImages}"
 IMAGE_ROOT="${IMAGE_ROOT:-$REPO_ROOT/my_code/data/OpenImages}"
-IMAGE_SOURCE="${IMAGE_SOURCE:-local}"
+IMAGE_SOURCE="${IMAGE_SOURCE:-downloaded}"
 ONLINE_CACHE_DIR="${ONLINE_CACHE_DIR:-}"
 ONLINE_TIMEOUT="${ONLINE_TIMEOUT:-15}"
 ONLINE_RETRIES="${ONLINE_RETRIES:-2}"
@@ -30,8 +30,8 @@ ALLOW_TRUNCATED_IMAGES="${ALLOW_TRUNCATED_IMAGES:-1}"
 SKIP_BAD_IMAGES="${SKIP_BAD_IMAGES:-1}"
 SKIP_MISSING_IMAGES="${SKIP_MISSING_IMAGES:-0}"
 IMAGE_ARGS=()
-if [[ "$IMAGE_SOURCE" != "local" && "$IMAGE_SOURCE" != "online" ]]; then
-  echo "IMAGE_SOURCE must be local or online" >&2
+if [[ "$IMAGE_SOURCE" != "local" && "$IMAGE_SOURCE" != "downloaded" && "$IMAGE_SOURCE" != "online" ]]; then
+  echo "IMAGE_SOURCE must be local, downloaded, or online" >&2
   exit 2
 fi
 if [[ -n "$ONLINE_CACHE_DIR" ]]; then
@@ -71,7 +71,7 @@ else
     fi
   done
   if [[ "$EXPLICIT_OUTPUT" == "0" ]]; then
-    OUTPUT_PATH="$OUTPUT_ROOT/clip_openimages_${MODEL_SLUG}_$(date +%Y%m%d_%H%M%S)_$$"
+    OUTPUT_PATH="$OUTPUT_ROOT/clip_openimages_${IMAGE_SOURCE}_${MODEL_SLUG}_$(date +%Y%m%d_%H%M%S)_$$"
     OUTPUT_ARGS=(--output-dir "$OUTPUT_PATH")
     OUTPUT_LABEL="$OUTPUT_PATH"
   fi
