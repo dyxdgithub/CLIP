@@ -598,12 +598,15 @@ def refresh_online_local_paths(samples, image_root, split):
 
 
 def read_openimages(csv_dir, image_root, skip_missing_images=False, image_source="local",
-                    selected_ids=None):
+                    selected_ids=None, validation_source="auto", holdout_fraction=0.05,
+                    seed=42):
     """Read official split CSVs and group rows sharing an ImageID."""
     if image_source not in ("local", "downloaded", "online"):
         raise ValueError("image_source must be local, downloaded, or online")
     if selected_ids is not None and image_source != "downloaded":
         raise ValueError("Frozen image selection requires downloaded mode")
+    if validation_source not in ("auto", "official", "train-holdout"):
+        raise ValueError("Unknown validation source: {}".format(validation_source))
     by_split = {}
     captions, caption_to_index = [], {}
     seen_image_ids = set()
@@ -613,11 +616,17 @@ def read_openimages(csv_dir, image_root, skip_missing_images=False, image_source
         csv_path = csv_dir / CSV_NAME.format(split)
         if not csv_path.is_file():
             raise FileNotFoundError("Missing {} CSV: {}".format(split, csv_path))
-        images = ({} if image_source == "downloaded" and split == "test" else
+        skip_official_validation = (image_source == "downloaded" and
+                                    validation_source == "train-holdout" and split == "validation")
+        images = ({} if image_source == "downloaded" and (split == "test" or skip_official_validation) else
                   discover_images(image_root / folder, allow_missing=image_source != "local"))
         if image_source == "local" and not images:
             raise FileNotFoundError("No downloaded images found in {}".format(image_root / folder))
         required_ids = set(selected_ids[split]) if selected_ids is not None else None
+        if required_ids is not None and image_source == "downloaded" and split == "train" and validation_source == "train-holdout":
+            required_ids.update(selected_ids["validation"])
+        if skip_official_validation:
+            required_ids = set()
         samples_by_id = {}
         split_ids, missing_ids, missing_selected = set(), set(), set()
         rows = 0
@@ -639,7 +648,8 @@ def read_openimages(csv_dir, image_root, skip_missing_images=False, image_source
                     raise ValueError("Empty caption at {} row {}".format(csv_path, row_number))
                 split_ids.add(image_id)
                 if image_source == "downloaded" and (
-                        split == "test" or (required_ids is not None and image_id not in required_ids)):
+                        split == "test" or skip_official_validation or
+                        (required_ids is not None and image_id not in required_ids)):
                     continue
                 image_path = images.get(image_id)
                 if image_source != "online" and image_path is None:
@@ -678,7 +688,8 @@ def read_openimages(csv_dir, image_root, skip_missing_images=False, image_source
             raise FileNotFoundError("{} downloaded images missing from {} CSV (e.g. {}). "
                                     "Finish downloading or use --skip-missing-images to change coverage.".format(
                                         len(missing_ids), split, examples))
-        if not samples_by_id and not (image_source == "downloaded" and split == "test"):
+        if not samples_by_id and not (image_source == "downloaded" and
+                                      (split == "test" or split == "validation")):
             raise ValueError("No usable images in {} split".format(split))
         seen_image_ids.update(split_ids)
         by_split[split] = list(samples_by_id.values())
@@ -697,14 +708,50 @@ def read_openimages(csv_dir, image_root, skip_missing_images=False, image_source
         else:
             print("{}: {} CSV rows, {} unique ImageIDs, {} available, {} missing".format(
                 split, rows, len(split_ids), len(samples_by_id), len(missing_ids)), flush=True)
-    return by_split, captions, csv_hashes, missing_counts
+    actual_validation_source = "official"
+    if image_source == "downloaded":
+        if validation_source == "auto":
+            actual_validation_source = ("official" if by_split["validation"] and
+                                        missing_counts["validation"] == 0 else "train-holdout")
+        else:
+            actual_validation_source = validation_source
+        if actual_validation_source == "train-holdout":
+            if len(by_split["train"]) < 3:
+                raise ValueError("Train holdout needs at least three downloaded training images")
+            if selected_ids is None:
+                holdout_size = max(1, min(len(by_split["train"]) - 2,
+                                          round(len(by_split["train"]) * holdout_fraction)))
+                ranked = sorted(by_split["train"], key=lambda sample: hashlib.sha256(
+                    "{}:{}".format(seed, sample.image_id).encode("ascii")).digest())
+                holdout_ids = {sample.image_id for sample in ranked[:holdout_size]}
+            else:
+                holdout_ids = set(selected_ids["validation"])
+            held_out, training = [], []
+            for sample in by_split["train"]:
+                if sample.image_id in holdout_ids:
+                    sample.split = "validation"
+                    held_out.append(sample)
+                else:
+                    training.append(sample)
+            if len(held_out) != len(holdout_ids) or not held_out or len(training) < 2:
+                raise ValueError("Frozen train holdout cannot be reconstructed")
+            by_split["train"], by_split["validation"] = training, held_out
+            print("Validation uses {} held-out training images ({} training images remain); "
+                  "official validation images are not used for selection".format(
+                      len(held_out), len(training)), flush=True)
+        elif not by_split["validation"]:
+            raise ValueError("No downloaded official validation images; use --validation-source auto or train-holdout")
+    return by_split, captions, csv_hashes, missing_counts, actual_validation_source
 
 
-def save_downloaded_manifest(path, by_split, csv_hashes):
+def save_downloaded_manifest(path, by_split, csv_hashes, validation_source,
+                             holdout_fraction):
     """Freeze the subset so later downloads cannot change a resumed run."""
     manifest = {
-        "version": 1,
+        "version": 2,
         "csv_sha256": csv_hashes,
+        "validation_source": validation_source,
+        "holdout_fraction": holdout_fraction if validation_source == "train-holdout" else None,
         "image_ids": {split: [sample.image_id for sample in by_split[split]]
                       for split in SPLIT_FOLDERS},
     }
@@ -723,9 +770,13 @@ def load_downloaded_manifest(path):
     with gzip.open(path, "rt", encoding="utf-8") as handle:
         manifest = json.load(handle)
     image_ids = manifest.get("image_ids")
-    if (manifest.get("version") != 1 or not isinstance(image_ids, dict)
+    if (manifest.get("version") not in (1, 2) or not isinstance(image_ids, dict)
             or set(image_ids) != set(SPLIT_FOLDERS)):
         raise ValueError("Invalid downloaded subset manifest: {}".format(path))
+    if manifest["version"] == 1:
+        manifest["validation_source"] = "official"
+    elif manifest.get("validation_source") not in ("official", "train-holdout"):
+        raise ValueError("Invalid validation source in {}".format(path))
     if image_ids["test"]:
         raise ValueError("Downloaded subset manifest must hold out the test split")
     for split, ids in image_ids.items():
@@ -760,6 +811,10 @@ def parse_args(argv=None):
                         help="Directory containing train/, val/, test/ image folders. Default: %(default)s.")
     parser.add_argument("--image-source", choices=("local", "downloaded", "online"), default="local",
                         help="local requires all CSV images; downloaded freezes available train/validation images; online fetches missing pixels. Default: %(default)s.")
+    parser.add_argument("--validation-source", choices=("auto", "official", "train-holdout"), default="auto",
+                        help="Downloaded mode: auto uses complete official validation, otherwise a frozen train holdout. Default: %(default)s.")
+    parser.add_argument("--holdout-fraction", type=float, default=0.05,
+                        help="Fraction of downloaded training images reserved when using a train holdout. Default: %(default)s.")
     parser.add_argument("--online-cache-dir", type=Path,
                         help="Optional persistent cache for fetched images; default: no extra cache. Choose a disk with enough free space.")
     parser.add_argument("--online-timeout", type=float, default=15.0,
@@ -808,6 +863,10 @@ def parse_args(argv=None):
         parser.error("Batch size must be at least 2; workers/warmup/decay/clip nonnegative; lr positive")
     if args.online_timeout <= 0 or args.online_retries < 1 or args.online_max_image_mb < 1:
         parser.error("Online timeout, retries and maximum image size must be positive")
+    if not 0 < args.holdout_fraction < 1:
+        parser.error("--holdout-fraction must be between 0 and 1")
+    if args.image_source != "downloaded" and args.validation_source != "auto":
+        parser.error("--validation-source is only configurable with --image-source downloaded")
     if args.image_source != "online" and args.online_cache_dir is not None:
         parser.error("--online-cache-dir requires --image-source online")
     if args.image_source != "local" and args.skip_missing_images:
@@ -838,9 +897,14 @@ def main(argv=None):
     manifest_path = args.output_dir / DOWNLOADED_MANIFEST
     frozen_manifest = (load_downloaded_manifest(manifest_path)
                        if args.image_source == "downloaded" and args.resume else None)
-    by_split, captions, csv_hashes, missing_counts = read_openimages(
+    effective_validation_source = (frozen_manifest["validation_source"] if frozen_manifest
+                                   else args.validation_source)
+    if frozen_manifest and args.validation_source not in ("auto", effective_validation_source):
+        raise ValueError("--validation-source differs from the resumed run's frozen manifest")
+    by_split, captions, csv_hashes, missing_counts, actual_validation_source = read_openimages(
         args.csv_dir, args.image_root, args.skip_missing_images, args.image_source,
-        frozen_manifest["image_ids"] if frozen_manifest else None)
+        frozen_manifest["image_ids"] if frozen_manifest else None,
+        effective_validation_source, args.holdout_fraction, args.seed)
     if frozen_manifest and frozen_manifest["csv_sha256"] != csv_hashes:
         raise ValueError("Open Images CSVs changed since this downloaded subset was frozen")
     print("Open Images: {}; unique captions: {}".format(
@@ -876,7 +940,8 @@ def main(argv=None):
         print("Saving frozen downloaded subset ({} train, {} validation images): {}".format(
             len(by_split["train"]), len(by_split["validation"]), manifest_path), flush=True)
         phase_start = time.perf_counter()
-        save_downloaded_manifest(manifest_path, by_split, csv_hashes)
+        save_downloaded_manifest(manifest_path, by_split, csv_hashes,
+                                 actual_validation_source, args.holdout_fraction)
         print("Subset manifest saved in {:.1f}s".format(
             time.perf_counter() - phase_start), flush=True)
     config_path = args.output_dir / "config.json"
@@ -890,9 +955,10 @@ def main(argv=None):
                        "missing_images": missing_counts if args.image_source == "local" else None,
                        "excluded_csv_images": missing_counts if args.image_source == "downloaded" else None,
                        "subset_manifest": str(manifest_path) if args.image_source == "downloaded" else None,
+                       "resolved_validation_source": actual_validation_source,
                        "image_source_policy": {
                            "local": "all CSV images from local files",
-                           "downloaded": "frozen downloaded train/validation subset; test held out",
+                           "downloaded": "frozen downloaded subset; test held out; validation source recorded separately",
                            "online": "local file, optional cache, CVDF S3, OriginalURL, Thumbnail300KURL",
                        }[args.image_source],
                        "caption_sampling": "one of each image's CSV captions, rotating by epoch",

@@ -9,6 +9,8 @@ PYTHON_BIN="${PYTHON_BIN:-python}"
 CSV_DIR="${CSV_DIR:-$REPO_ROOT/my_code/data/OpenImages}"
 IMAGE_ROOT="${IMAGE_ROOT:-$REPO_ROOT/my_code/data/OpenImages}"
 IMAGE_SOURCE="${IMAGE_SOURCE:-downloaded}"
+VALIDATION_SOURCE="${VALIDATION_SOURCE:-auto}"
+HOLDOUT_FRACTION="${HOLDOUT_FRACTION:-0.05}"
 ONLINE_CACHE_DIR="${ONLINE_CACHE_DIR:-}"
 ONLINE_TIMEOUT="${ONLINE_TIMEOUT:-15}"
 ONLINE_RETRIES="${ONLINE_RETRIES:-2}"
@@ -84,6 +86,8 @@ printf 'Open Images training: CSV=%s images=%s source=%s model=%s device=%s batc
   --csv-dir "$CSV_DIR" \
   --image-root "$IMAGE_ROOT" \
   --image-source "$IMAGE_SOURCE" \
+  --validation-source "$VALIDATION_SOURCE" \
+  --holdout-fraction "$HOLDOUT_FRACTION" \
   --online-timeout "$ONLINE_TIMEOUT" \
   --online-retries "$ONLINE_RETRIES" \
   --online-max-image-mb "$ONLINE_MAX_IMAGE_MB" \
