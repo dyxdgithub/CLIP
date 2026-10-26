@@ -39,6 +39,34 @@ Recall@1/5/10。验证选最佳 checkpoint，训练默认不评估测试集；
 确定最终配置后再显式运行测试。
 候选文本按完全相同的字符串去重，评估时允许一个查询有多个正确匹配。
 
+## Flickr30K：SCT 硬负例实验
+
+`finetune_clip_flickr30k_sct.py` 将 Xuan 等（2020）论文第 5 节的 Selectively
+Contrastive Triplet（SCT）方法用于图文配对：每张图与本轮配对 caption 为正例，
+从同一 batch 中选余弦相似度最高的不同 caption 作为负例；文搜图方向对称处理。
+若负例比正例更相似，SCT 只最小化 `lambda * 负例相似度`；否则使用
+`softplus(负例相似度 - 正例相似度)`。相同 caption 不作负例。论文研究的是
+同模态图像度量学习；这里是跨模态改编，不能将结果称为论文设置的复现。
+
+使用同一脚本的 `hn` 模式作为主要对照：批内硬负例选择、图文编码器、数据顺序、
+优化器和验证方法相同，所有三元组均使用普通 NCA 损失。两种模式都用未缩放的
+单位向量余弦相似度，并冻结未参与该损失的 CLIP `logit_scale`；图像和文本编码器
+仍进行全参数微调。
+
+```bash
+OBJECTIVE=sct SCT_LAMBDA=1.0 bash my_code/train/run_finetune_clip_flickr30k_sct.sh
+OBJECTIVE=hn bash my_code/train/run_finetune_clip_flickr30k_sct.sh
+```
+
+启动器默认与 Flickr30K CLIP 基线使用相同的 `ViT-B/32`、50 epoch、batch 256、
+学习率 `1e-5` 和 seed 42。两次运行应保持这些参数、数据 revision 及坏图策略一致。
+验证集的图搜文、文搜图 Recall@1/5/10 与六项均值用于选择各自的 `best.pt`；
+`validation/loss_total` 仍是统一计算的 CLIP 多正例 InfoNCE，仅作共同诊断，
+不要与 SCT 的训练损失直接比较。TensorBoard 还记录两个方向的硬三元组比例。
+确定设置后，用 `my_code/test/run_test_clip_flickr30k.sh` 分别测试两个 `best.pt`，
+比较同一 test 集上的 Recall；不要用 test 集选择 `SCT_LAMBDA`。单次运行只能提供
+初步证据，正式结论建议用多个固定 seed 的配对实验。
+
 ## 多标签分类
 
 ```bash
