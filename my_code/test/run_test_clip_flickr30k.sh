@@ -7,8 +7,21 @@ cd "$REPO_ROOT"
 
 export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 
-CHECKPOINT="${1:?Usage: bash my_code/test/run_test_clip_flickr30k.sh /path/to/best.pt [options]}"
-shift
+if [[ $# -lt 1 ]]; then
+  echo "Usage: bash my_code/test/run_test_clip_flickr30k.sh /path/to/best.pt [options]" >&2
+  echo "   or: bash my_code/test/run_test_clip_flickr30k.sh pretrained ViT-B/32 [--config /path/to/config.json] [options]" >&2
+  exit 2
+fi
+if [[ "$1" == "pretrained" ]]; then
+  shift
+  MODEL_NAME="${1:?Specify a CLIP model name after pretrained, e.g. ViT-B/32}"
+  shift
+  SOURCE_ARGS=(--pretrained "$MODEL_NAME")
+else
+  CHECKPOINT="$1"
+  shift
+  SOURCE_ARGS=(--checkpoint "$CHECKPOINT")
+fi
 PYTHON_BIN="${PYTHON_BIN:-python}"
 DEVICE="${DEVICE:-cuda:3}"
 PRECISION="${PRECISION:-auto}"
@@ -18,7 +31,7 @@ SCORE_BATCH_SIZE="${SCORE_BATCH_SIZE:-128}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 
 "$PYTHON_BIN" my_code/test/test_clip_flickr30k.py \
-  --checkpoint "$CHECKPOINT" \
+  "${SOURCE_ARGS[@]}" \
   --device "$DEVICE" \
   --precision "$PRECISION" \
   --split "$EVAL_SPLIT" \

@@ -48,4 +48,26 @@ python my_code/test/test_clip_retrieval.py --checkpoint /path/to/best.pt --devic
 tensorboard --logdir my_code/test/output
 ```
 
+## Flickr30K：微调前后对比
+
+原始 OpenAI CLIP `ViT-B/32` 可用同一套 Flickr30K 检索评估直接测试，
+不需要先把它保存成微调 checkpoint。建议传入目标训练运行的 `config.json`，
+以复用其固定的数据集 revision 并核对测试集摘要：
+
+```bash
+bash my_code/test/run_test_clip_flickr30k.sh pretrained ViT-B/32 \
+  --config my_code/train/output/<run>/config.json
+```
+
+测试微调模型则传入该运行的 `best.pt`：
+
+```bash
+bash my_code/test/run_test_clip_flickr30k.sh my_code/train/output/<run>/best.pt
+```
+
+两种模式默认都评估 test 集，使用相同的图文检索 Recall@1/5/10 和批内损失，
+并将指标及 TensorBoard 日志写入 `my_code/test/output/` 下各自的新目录。
+如要比较批内损失，使用相同的 `EVAL_BATCH_SIZE`；Recall 指标按整个
+test 集计算。`EVAL_SPLIT=validation` 可用于诊断，最终报告使用 test 集。
+
 环境依赖与训练一致：`python -m pip install -r my_code/train/requirements.txt`。
